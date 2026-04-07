@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import subprocess
+import argparse
+import sys
+import time
+import datetime
+import os
+import fcntl
+
+# --- Helpers ---
+
+def parse_duration(val):
+    if not val or val == "-": return 0
+    val = str(val).lower().strip()
+    if val.isdigit(): return int(val) * 60
+    try:
+        unit = val[-1]
+        num = float(val[:-1])
+        if unit == 'm': return int(num * 60)
+        if unit == 'h': return int(num * 3600)
+        if unit == 'd': return int(num * 86400)
+    except: return 0
+    return 0
+
+def human_duration(seconds):
+    if seconds <= 0: return "0s"
+    if seconds >= 86400 and seconds % 86400 == 0: return f"{int(seconds // 86400)}d"
+    if seconds >= 3600 and seconds % 3600 == 0: return f"{int(seconds // 3600)}h"
+    if seconds >= 60 and seconds % 60 == 0: return f"{int(seconds // 60)}m"
+    if seconds >= 86400: return f"{round(seconds / 86400, 2)}d"
+    if seconds >= 3600: return f"{round(seconds / 3600, 2)}h"
+    return f"{int(seconds // 60)}m"
+
+# --- Core Logic ---
+
+class ZzDataset:
+    def __init__(self, name):
+        self.name = name
+        self.props = self._get_props()
+
+    def _get_props(self):
+        try:
+            subprocess.check_call(["zfs", "list", self.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd = ["zfs", "get", "all", "-H", "-o", "property,value", self.name]
+            res = subprocess.check_output(cmd, encoding='utf-8')
+            return {p: v for p, v in (line.split('\t') for line in res.strip().split('\n')) if p.startswith("zz:")}
+        except: return None
+
+    @property
+    def target(self): return self.props.get("zz:target", "-")
+    
+    @property
+    def last_sync(self):
+        val = self.props.get("zz:last_sync", "0")
+        return int(val) if val.isdigit() else 0
+
+    def set_prop(self, prop, value):
+        subprocess.run(["zfs", "set", f"zz:{prop}={value}", self.name], check=True)
+
+def get_managed_datasets():
+    """Find local filesystems where zz:target is explicitly set."""
+    try:
+        cmd = ["zfs", "get", "-H", "-t", "filesystem", "-s", "local", "-o", "name", "zz:target"]
+        res = subprocess.check_output(cmd, encoding='utf-8')
+        return [line.strip() for line in res.strip().split('\n') if line.strip() and line.strip() != "NAME"]
+    except: return []
+
+# --- Actions ---
+
+def run_prune(ds, remote_host=None):
+    is_remote = remote_host is not None
+    prop_name = "zz:keep_remote" if is_remote else "zz:keep_local"
+    retention_sec = parse_duration(ds.props.get(prop_name, "7d"))
+    
+    label = f"remote ({remote_host})" if is_remote else "local"
+    print(f"    [*] Pruning {label} (keeping {human_duration(retention_sec)})...")
+    
+    cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name,creation", "-p", "-S", "creation", ds.name]
+    if is_remote: cmd = ["ssh", "-o", "BatchMode=yes", remote_host] + cmd
+    
+    try:
+        res = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
+        snapshots = [(l.split('\t')[0], int(l.split('\t')[1])) for l in res.strip().split('\n') if "@zz_auto_" in l]
+        
+        if len(snapshots) <= 2:
+            print(f"        [-] Too few snapshots to prune."); return
+
+        now = int(time.time())
+        to_delete = [s[0] for s in snapshots[2:] if (now - s[1]) > retention_sec]
+
+        if not to_delete:
+            print(f"        [-] No expired snapshots found."); return
+
+        for snap in to_delete:
+            print(f"        [-] Destroying {snap}")
+            del_cmd = ["zfs", "destroy", "-r", snap]
+            if is_remote: del_cmd = ["ssh", remote_host] + del_cmd
+            subprocess.run(del_cmd, check=True)
+    except: pass
+
+def run_init(args):
+    ds = ZzDataset(args.dataset)
+    if not ds or ds.props is None:
+        print(f"[!] Error: Dataset '{args.dataset}' not found."); return
+
+    remote_host, remote_path = args.remote.split(':')
+    remote_pool = remote_path.split('/')[0]
+    
+    print(f"[*] Initializing {args.dataset} -> {args.remote}")
+    ds.set_prop("target", args.remote)
+    ds.set_prop("freq", args.freq)
+    ds.set_prop("keep_local", args.keep_local)
+    ds.set_prop("keep_remote", args.keep_remote)
+
+    snap = f"zz_auto_{int(time.time())}"
+    subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], check=True)
+
+    print(f"[*] Performing initial full transfer...")
+    send = subprocess.Popen(["zfs", "send", "-R", f"{args.dataset}@{snap}"], stdout=subprocess.PIPE)
+    recv = subprocess.Popen(["ssh", remote_host, f"zfs recv -du {remote_pool}"], stdin=send.stdout)
+    send.stdout.close(); recv.communicate()
+
+    if recv.returncode == 0:
+        ds.set_prop("last_sync", (int(time.time()) // 60) * 60)
+        print("[+] Init successful.")
+
+def run_sync(args):
+    names = [args.dataset] if args.dataset else get_managed_datasets()
+    
+    for name in names:
+        ds = ZzDataset(name)
+        if not ds or not ds.props or ds.target == "-": continue
+
+        lock_path = f"/tmp/zz_{name.replace('/', '_')}.lock"
+        lock_f = open(lock_path, 'w')
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            continue 
+
+        freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
+        if not args.force and (int(time.time()) - ds.last_sync) < (freq_sec - 10):
+            lock_f.close(); continue
+
+        print(f"[*] Processing {ds.name}...")
+        remote_host, remote_path = ds.target.split(':')
+        remote_pool = remote_path.split('/')[0]
+
+        new_snap_tag = f"zz_auto_{int(time.time())}"
+        subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
+
+        try:
+            cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {ds.name}"]
+            res = subprocess.check_output(cmd, encoding='utf-8')
+            remote_snaps = [l.strip().split('@')[1] for l in res.strip().split('\n') if "@zz_auto_" in l]
+            bridge = remote_snaps[0]
+        except:
+            print("    [!] Error: Could not find bridge."); lock_f.close(); continue
+
+        cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name", "-s", "creation", ds.name]
+        local_list = subprocess.check_output(cmd, encoding='utf-8').strip().split('\n')
+        
+        pending = []
+        found_bridge = False
+        for s in local_list:
+            tag = s.split('@')[1] if '@' in s else ""
+            if tag == bridge: found_bridge = True; continue
+            if found_bridge and "@zz_auto_" in s: pending.append(tag)
+
+        current_base = bridge
+        success = True
+        for next_tag in pending:
+            print(f"    [*] Sending @{current_base} -> @{next_tag}")
+            send = subprocess.Popen(["zfs", "send", "-R", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"], stdout=subprocess.PIPE)
+            recv = subprocess.Popen(["ssh", remote_host, f"zfs recv -du {remote_pool}"], stdin=send.stdout)
+            send.stdout.close(); recv.communicate()
+            
+            if recv.returncode != 0:
+                print(f"    [!] Transfer failed at @{next_tag}."); success = False; break
+            current_base = next_tag
+
+        if success:
+            ds.set_prop("last_sync", (int(time.time()) // 60) * 60)
+            run_prune(ds)
+            run_prune(ds, remote_host)
+            print(f"    [+] Sync complete.")
+            
+        fcntl.flock(lock_f, fcntl.LOCK_UN)
+        lock_f.close()
+
+def run_forget(args):
+    ds = ZzDataset(args.dataset)
+    if not ds or not ds.props:
+        print(f"[!] {args.dataset} is not managed by zz."); return
+
+    print(f"[*] Removing zz management from {args.dataset}...")
+    for prop in list(ds.props.keys()):
+        subprocess.run(["zfs", "inherit", prop, ds.name])
+    
+    confirm = input("    > Also delete all local @zz_auto snapshots? (y/N): ")
+    if confirm.lower() == 'y':
+        cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name", ds.name]
+        res = subprocess.check_output(cmd, encoding='utf-8')
+        for line in res.strip().split('\n'):
+            if "@zz_auto_" in line:
+                print(f"        [-] Destroying {line}")
+                subprocess.run(["zfs", "destroy", line])
+    print("[+] Done. Remote backup remains untouched.")
+
+def run_restore(args):
+    remote_host, remote_ds = args.remote.split(':')
+    local_ds = args.local_dataset
+    local_pool = local_ds.split('/')[0]
+
+    print(f"[*] Starting Disaster Recovery: {args.remote} -> {local_ds}")
+    cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {remote_ds}"]
+    try:
+        res = subprocess.check_output(cmd, encoding='utf-8')
+        latest_remote_snap = res.strip().split('\n')[0]
+        print(f"    [*] Found latest remote snapshot: {latest_remote_snap}")
+    except:
+        print("    [!] Error: Could not reach remote or find snapshots."); return
+
+    print(f"    [*] Pulling data (this may take a while)...")
+    send = subprocess.Popen(["ssh", remote_host, f"zfs send -R {latest_remote_snap}"], stdout=subprocess.PIPE)
+    recv = subprocess.Popen(["zfs", "recv", "-du", local_pool], stdin=send.stdout)
+    send.stdout.close(); recv.communicate()
+
+    if recv.returncode == 0:
+        print(f"[+] Restore successful! Re-linking zz management...")
+        ds = ZzDataset(local_ds)
+        # Re-set properties to ensure the 'Contract' is healthy
+        ds.set_prop("target", args.remote)
+        ds.set_prop("last_sync", (int(time.time()) // 60) * 60)
+        print(f"[+] Done. Resume cron jobs as normal.")
+    else:
+        print("[!] Restore failed.")
+
+def run_status(args):
+    managed = get_managed_datasets()
+    if not managed:
+        print("No zz-managed datasets found."); return
+    print(f"{'DATASET':<20} | {'STATUS':<10} | {'LAST SYNC':<18} | {'NEXT SYNC'}")
+    print("-" * 75)
+    for name in managed:
+        ds = ZzDataset(name)
+        now = int(time.time())
+        gap = now - ds.last_sync
+        freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
+        if ds.last_sync == 0:
+            status, last_str, next_run = "NEW", "Never", "DUE NOW"
+        else:
+            status = "OK" if gap < freq_sec else "DELAYED"
+            last_str = str(datetime.timedelta(seconds=gap)).split('.')[0] + " ago"
+            next_run = "DUE NOW" if gap >= freq_sec else str(datetime.timedelta(seconds=freq_sec-gap)).split('.')[0]
+        print(f"{name:<20} | {status:<10} | {last_str:<18} | {next_run}")
+
+def run_meta(args):
+    ds = ZzDataset(args.dataset)
+    if not ds or not ds.props:
+        print(f"Dataset '{args.dataset}' not managed."); return
+    print(f"\n[ zz Contract: {args.dataset} ]")
+    print(f"{'DESCRIPTION':<22} | {'KEY':<12} | {'VALUE'}")
+    print("-" * 65)
+    fields = [('Remote Target','target','zz:target'), ('Sync Frequency','freq','zz:freq'), 
+              ('Local Retention','keep_local','zz:keep_local'), ('Remote Retention','keep_remote','zz:keep_remote')]
+    for desc, key, prop in fields:
+        val = ds.props.get(prop, "-")
+        if key in ['freq', 'keep_local', 'keep_remote']: val = human_duration(parse_duration(val))
+        print(f"{desc:<22} | {key:<12} | {val}")
+
+def run_set(args):
+    ds = ZzDataset(args.dataset)
+    if ds: ds.set_prop(args.prop, args.value); print(f"[*] Updated {args.prop} to {args.value}")
+
+def main():
+    parser = argparse.ArgumentParser(prog='zz', description='Zeasy: Simplified ZFS Replication')
+    subparsers = parser.add_subparsers(title='Commands', dest='command')
+
+    pi = subparsers.add_parser('init', help='Setup replication')
+    pi.add_argument('dataset')
+    pi.add_argument('remote')
+    pi.add_argument('--freq', default='60m')
+    pi.add_argument('--keep-local', default='7d')
+    pi.add_argument('--keep-remote', default='30d')
+    pi.set_defaults(func=run_init)
+
+    ps = subparsers.add_parser('sync', help='Run incremental sync')
+    ps.add_argument('dataset', nargs='?')
+    ps.add_argument('--force', action='store_true')
+    ps.set_defaults(func=run_sync)
+
+    pst = subparsers.add_parser('status', help='Show health')
+    pst.set_defaults(func=run_status)
+
+    pm = subparsers.add_parser('meta', help='View config')
+    pm.add_argument('dataset')
+    pm.set_defaults(func=run_meta)
+
+    pset = subparsers.add_parser('set', help='Update properties')
+    pset.add_argument('dataset')
+    pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote'])
+    pset.add_argument('value')
+    pset.set_defaults(func=run_set)
+
+    pf = subparsers.add_parser('forget', help='Stop tracking a dataset')
+    pf.add_argument('dataset')
+    pf.set_defaults(func=run_forget)
+
+    pr = subparsers.add_parser('restore', help='Recover dataset from remote')
+    pr.add_argument('remote', help='Source (e.g. backup-server:pool/path)')
+    pr.add_argument('local_dataset', help='Target (e.g. tank/recovered)')
+    pr.set_defaults(func=run_restore)
+
+    args = parser.parse_args()
+    if hasattr(args, 'func'): args.func(args)
+    else: parser.print_help()
+
+if __name__ == "__main__":
+    main()
