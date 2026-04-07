@@ -1,7 +1,36 @@
-zz (Zeasy)Minimalist, Snapshot-Aware ZFS Replicationzz is a lightweight Python utility designed to make ZFS off-site replication "Zeasy." It handles the heavy lifting of incremental sends, retention policies, and disaster recovery, ensuring your data is always backed up without the complexity of enterprise-grade storage orchestrators.🚀 Key FeaturesAtomic Locking: Prevents overlapping cron jobs from colliding.Sequential Catch-Up: Automatically detects and sends missing snapshot history if the network or server was down.Phase-Drift Correction: Built-in "slop" and timestamp flooring to ensure syncs stay aligned with the clock.Dual Retention: Maintain a short history locally (e.g., 1 hour) and a long history remotely (e.g., 30 days).One-Command Recovery: Rebuild a dead local dataset from your remote target with a single restore command.🛠️ InstallationEnsure Python 3.6+ is installed on your Rocky Linux (or any Linux) host.Drop the zz script into /usr/local/bin/.Make it executable:Bashchmod +x /usr/local/bin/zz
-Ensure SSH Key-Based Authentication is configured between the local and remote host.📖 Usage Guide1. Initialize a RelationshipTo start backing up a dataset, use init. This performs the initial full transfer.Bashzz init tank/data backup-server:pool/data --freq 5m --keep-local 1h --keep-remote 7d
-2. Automate with CronAdd zz sync to your crontab. Since zz handles its own locking, you can run it every minute to ensure it never misses a window.Bash* * * * * /usr/local/bin/zz sync >> /var/log/zz.log 2>&1
-3. Check StatusView the health and timing of all managed datasets:Bashzz status
-4. Disaster RecoveryIf the local dataset is lost, recreate the pool and pull everything back (including metadata):Bashzz restore backup-server:pool/data tank/data
-⚙️ Configuration (The Contract)zz stores its configuration directly in ZFS user properties. You can view or edit these at any time:PropertyDescriptionExamplezz:targetThe remote SSH target and path192.168.1.50:backup/testzz:freqHow often to sync (m, h, d)5m, 1h, 30dzz:keep_localLocal snapshot retention window1hzz:keep_remoteRemote snapshot retention window30dTo update a setting manually:Bashzz set tank/data freq 15m
-⚠️ Important NotesSnapshots: zz only manages snapshots prefixed with @zz_auto_. It will not touch your manual snapshots.Read-Only Targets: It is highly recommended to keep the remote dataset unmounted or readonly=on to prevent divergence.Force Sync: Use zz sync --force to bypass the frequency timer.📄 LicenseMIT License - Keep it Zeasy.
+# zz (Zeasy) 
+### *Minimalist, Snapshot-Aware ZFS Replication*
+
+**zz** is a lightweight Python utility designed to make ZFS off-site replication "Zeasy." It handles the heavy lifting of incremental sends, retention policies, and disaster recovery, ensuring your data is always backed up without the complexity of enterprise-grade storage orchestrators.
+
+---
+
+## 🚀 Key Features
+
+* **Atomic Locking:** Internal file locking prevents overlapping cron jobs from colliding.
+* **Sequential Catch-Up:** Automatically detects and sends missing snapshot history if the network or server was down.
+* **Phase-Drift Correction:** Built-in "slop" and timestamp flooring ensures syncs stay aligned with clock and minute boundaries.
+* **Dual Retention:** Maintain independent history windows (e.g., keep 1 hour of history locally but 30 days remotely).
+* **One-Command Recovery:** Rebuild a lost local dataset from your remote target with a single `restore` command.
+* **Zero-Database:** All configuration is stored directly in ZFS user properties on the dataset itself.
+
+---
+
+## 🛠️ Installation
+
+1.  Ensure **Python 3.6+** is installed on your host (Tested on Rocky Linux 9).
+2.  Download the `zz` script to `/usr/local/bin/`.
+3.  Make it executable:
+    ```bash
+    chmod +x /usr/local/bin/zz
+    ```
+4.  Ensure **SSH Key-Based Authentication** is configured between the local and remote host.
+
+---
+
+## 📖 Usage Guide
+
+### 1. Initialize a Relationship
+To start backing up a dataset, use `init`. This performs the initial full transfer and sets the backup "contract."
+```bash
+zz init tank/data backup-server:pool/data --freq 5m --keep-local 1h --keep-remote 7d
