@@ -34,3 +34,22 @@
 To start backing up a dataset, use `init`. This performs the initial full transfer and sets the backup "contract."
 ```bash
 zz init tank/data backup-server:pool/data --freq 5m --keep-local 1h --keep-remote 7d
+
+### 2. Automate with Cron
+Add zz sync to your crontab. It handles its own locking and timing checks.
+```bash
+* * * * * /usr/local/bin/zz sync >> /var/log/zz.log 2>&1
+
+### 3. Check Status
+View health, last sync time, and countdown for all managed datasets:
+```bash
+zz status
+
+### 4. Disaster Recovery (Restore)Recreate a lost dataset from the remote (includes all metadata and history):
+```bash
+zz restore backup-server:pool/data tank/data
+
+### 5. Stop Tracking (Forget)Remove zz management but keep your data.Bashzz forget tank/data
+⚙️ Configuration (The Contract)zz stores configuration in ZFS user properties. The settings move with the dataset.PropertyDescriptionDefaultExamplezz:targetRemote SSH target and path-192.168.60.62:tank/testzz:freqHow often to sync60m5m, 1h, 30dzz:keep_localLocal retention window7d1h, 2h, 1dzz:keep_remoteRemote retention window30d24h, 30d, 1yManual Updates & MetaUpdate a setting without re-initializing:Bashzz set tank/data freq 15m
+View the current "contract" for a specific dataset:Bashzz meta tank/data
+⚠️ Important NotesSnapshots: zz only manages snapshots prefixed with @zz_auto_.Remote Integrity: zz uses incremental sends without the -F (Force) flag. Do not modify the remote dataset directly (keep it readonly=on) to avoid stream divergence.Lock Files: Stored in /tmp/zz_[dataset_name].lock to prevent overlapping runs.Phase-Drift: The script "floors" the last sync time to the nearest minute to prevent the schedule from slowly drifting forward.📄 LicenseMIT License - Keep it Zeasy.
