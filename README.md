@@ -15,7 +15,7 @@ This project was started after years of frustration with other zfs replication t
 * **Atomic Locking:** Internal file locking prevents overlapping cron jobs from colliding.
 * **Sequential Catch-Up:** Automatically detects and sends missing snapshot history if the network or server was down.
 * **Phase-Drift Correction:** Built-in "slop" and timestamp flooring ensures syncs stay aligned with clock and minute boundaries.
-* **Dual Retention:** Maintain independent history windows (e.g., keep 1 hour of history locally but 30 days remotely).
+* **Dual Retention & Pruning:** Maintain independent history windows (e.g., keep 1 hour of history locally but 30 days remotely).
 * **One-Command Recovery:** Rebuild a lost local dataset from your remote target with a single `restore` command.
 * **Zero-Database:** All configuration is stored directly in ZFS user properties on the dataset itself.
 
