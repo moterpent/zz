@@ -1,26 +1,31 @@
 #!/bin/bash
 
-# Usage: zfs list -t snap | ./zz-delta
+# Usage: zfs list -t snap [dataset] | ./zz-delta
 
 prev_ts=0
 
-echo -e "SNAPSHOT_TAG\t\tDELTA_SEC\tHUMAN_TIME"
-echo -e "------------------------------------------------------------"
+# Print Header
+printf "%-15s | %-22s | %-10s | %-10s\n" "SNAPSHOT_TAG" "TIMESTAMP" "DELTA" "HUMAN"
+echo "---------------------------------------------------------------------------"
 
 while read -r line; do
-    # Filter for our zz_auto snapshots and extract the timestamp
+    # Filter for zz_auto snapshots
     if [[ "$line" == *"@zz_auto_"* ]]; then
-        # Extract the numbers after @zz_auto_
+        # Extract the integer timestamp
         ts=$(echo "$line" | grep -oP '(?<=@zz_auto_)[0-9]+')
         
+        # Convert Unix TS to readable date
+        # Use 'date -d @ts' for Linux/GNU or 'date -r ts' for BSD/macOS
+        readable_date=$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$ts" "+%Y-%m-%d %H:%M:%S")
+
         if [ "$prev_ts" -eq 0 ]; then
-            # First snapshot in the list
-            echo -e "$ts\t---\t\tInitial"
+            # First snapshot in the set
+            printf "%-15s | %-22s | %-10s | %-10s\n" "$ts" "$readable_date" "---" "Initial"
         else
             # Calculate difference
             delta=$((ts - prev_ts))
             
-            # Format human time
+            # Format human delta
             if [ $delta -ge 60 ]; then
                 min=$((delta / 60))
                 sec=$((delta % 60))
@@ -29,7 +34,7 @@ while read -r line; do
                 human="${delta}s"
             fi
             
-            echo -e "$ts\t$delta\t\t$human"
+            printf "%-15s | %-22s | %-10s | %-10s\n" "$ts" "$readable_date" "${delta}s" "$human"
         fi
         prev_ts=$ts
     fi
