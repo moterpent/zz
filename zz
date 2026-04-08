@@ -278,49 +278,70 @@ def run_set(args):
     if ds: ds.set_prop(args.prop, args.value); print(f"[*] Updated {args.prop} to {args.value}")
 
 def main():
-    parser = argparse.ArgumentParser(prog='zz', description='Zeasy: Simplified ZFS Replication')
-    subparsers = parser.add_subparsers(title='Commands', dest='command')
+    # Define the main parser with a custom formatter for better visibility
+    parser = argparse.ArgumentParser(
+        prog='zz', 
+        description='Zeasy: Simplified ZFS Replication',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Usage Examples:
+  zz init tank/data backup:pool/data --freq 1h --keep-min 20
+  zz sync --force
+  zz restore backup:pool/data tank/data --latest
+        """
+    )
+    
+    subparsers = parser.add_subparsers(title='Commands', dest='command', metavar='<command>')
 
-    pi = subparsers.add_parser('init', help='Setup replication')
-    pi.add_argument('dataset')
-    pi.add_argument('remote')
-    pi.add_argument('--freq', default='60m')
-    pi.add_argument('--keep-local', default='7d')
-    pi.add_argument('--keep-remote', default='30d')
-    pi.add_argument('--keep-min', default='10')
+    # --- init ---
+    pi = subparsers.add_parser('init', help='Setup replication [dataset] [remote] [--freq] [--keep-local] [--keep-remote] [--keep-min]')
+    pi.add_argument('dataset', help='Local ZFS dataset (e.g., tank/data)')
+    pi.add_argument('remote', help='Remote target (e.g., user@host:pool/path)')
+    pi.add_argument('--freq', default='60m', help='Sync interval (e.g., 5m, 1h, 1d) [Default: 60m]')
+    pi.add_argument('--keep-local', default='7d', help='Local snapshot retention [Default: 7d]')
+    pi.add_argument('--keep-remote', default='30d', help='Remote snapshot retention [Default: 30d]')
+    pi.add_argument('--keep-min', default='10', help='Safety Floor: Minimum snapshots to keep regardless of age [Default: 10]')
     pi.set_defaults(func=run_init)
 
-    ps = subparsers.add_parser('sync', help='Run incremental sync')
-    ps.add_argument('dataset', nargs='?')
-    ps.add_argument('--force', action='store_true')
+    # --- sync ---
+    ps = subparsers.add_parser('sync', help='Run incremental sync [dataset] [--force]')
+    ps.add_argument('dataset', nargs='?', help='Specific dataset to sync (optional)')
+    ps.add_argument('--force', action='store_true', help='Ignore frequency timer and sync immediately')
     ps.set_defaults(func=run_sync)
 
-    pst = subparsers.add_parser('status', help='Show health')
+    # --- status ---
+    pst = subparsers.add_parser('status', help='Show health of all managed datasets')
     pst.set_defaults(func=run_status)
 
-    pm = subparsers.add_parser('meta', help='View config')
-    pm.add_argument('dataset')
+    # --- meta ---
+    pm = subparsers.add_parser('meta', help='View configuration contract [dataset]')
+    pm.add_argument('dataset', help='Managed dataset name')
     pm.set_defaults(func=run_meta)
 
-    pset = subparsers.add_parser('set', help='Update properties')
-    pset.add_argument('dataset')
-    pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min'])
-    pset.add_argument('value')
+    # --- set ---
+    pset = subparsers.add_parser('set', help='Update properties [dataset] [prop] [value]')
+    pset.add_argument('dataset', help='Managed dataset name')
+    pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min'], help='Property to update')
+    pset.add_argument('value', help='New value for the property')
     pset.set_defaults(func=run_set)
 
-    pf = subparsers.add_parser('forget', help='Stop tracking')
-    pf.add_argument('dataset')
+    # --- forget ---
+    pf = subparsers.add_parser('forget', help='Stop tracking a dataset [dataset]')
+    pf.add_argument('dataset', help='Dataset to remove from zz management')
     pf.set_defaults(func=run_forget)
 
-    pr = subparsers.add_parser('restore', help='Recover from remote')
-    pr.add_argument('remote')
-    pr.add_argument('local_dataset')
-    pr.add_argument('--latest', action='store_true', help='Only pull latest snapshot (faster)')
+    # --- restore ---
+    pr = subparsers.add_parser('restore', help='Recover from remote [remote] [local_dataset] [--latest]')
+    pr.add_argument('remote', help='Source (e.g. backup-server:pool/path)')
+    pr.add_argument('local_dataset', help='Local target path (e.g. tank/recovered)')
+    pr.add_argument('--latest', action='store_true', help='Speed Run: Pull only the single latest snapshot (skips history)')
     pr.set_defaults(func=run_restore)
 
     args = parser.parse_args()
-    if hasattr(args, 'func'): args.func(args)
-    else: parser.print_help()
+    if hasattr(args, 'func'):
+        args.func(args)
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
