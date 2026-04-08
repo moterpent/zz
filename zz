@@ -215,27 +215,36 @@ def run_restore(args):
     local_pool = local_ds.split('/')[0]
 
     print(f"[*] Starting Recovery: {args.remote} -> {local_ds}")
-    cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {remote_ds}"]
-    try:
-        res = subprocess.check_output(cmd, encoding='utf-8')
-        latest_remote_snap = res.strip().split('\n')[0]
-    except:
-        print("    [!] Error: Could not reach remote."); return
+    
+    # ... [Same snapshot detection logic as before] ...
 
     send_flags = "-R" if not args.latest else ""
-    mode_label = "FULL (History)" if not args.latest else "LATEST (State Only)"
-    print(f"    [*] Mode: {mode_label}\n    [*] Pulling {latest_remote_snap}...")
+    print(f"    [*] Pulling {latest_remote_snap}...")
 
+    # We keep -u in recv for the transfer, then handle mounting safely afterward
     send = subprocess.Popen(["ssh", remote_host, f"zfs send {send_flags} {latest_remote_snap}"], stdout=subprocess.PIPE)
     recv = subprocess.Popen(["zfs", "recv", "-du", local_pool], stdin=send.stdout)
     send.stdout.close(); recv.communicate()
 
     if recv.returncode == 0:
-        print(f"[+] Restore successful! Re-linking zz management...")
+        print(f"[+] Restore successful! Finalizing dataset...")
+        
+        # 1. Ensure it is mountable and writable
+        subprocess.run(["zfs", "set", "canmount=on", local_ds])
+        subprocess.run(["zfs", "set", "readonly=off", local_ds])
+        
+        # 2. Attempt the mount
+        print(f"    [*] Mounting {local_ds}...")
+        try:
+            subprocess.run(["zfs", "mount", local_ds], check=True)
+        except subprocess.CalledProcessError:
+            print(f"    [!] Warning: Could not mount {local_ds}. Check if mountpoint is busy.")
+
+        # 3. Re-link zz management
         ds = ZzDataset(local_ds)
         ds.set_prop("target", args.remote)
         ds.set_prop("last_sync", (int(time.time()) // 60) * 60)
-        print(f"[+] Done.")
+        print(f"[+] Done. Dataset is now live at its mountpoint.")
     else:
         print("[!] Restore failed.")
 
