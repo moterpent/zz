@@ -71,7 +71,7 @@ zz stores configuration in ZFS user properties. The settings move with the datas
 |Property     |Description|Default|Example|
 |-------------|---------------|-------------------|-------------|
 |zz:target     |Remote SSH target and path|-|192.168.60.62:tank/test|
-|zz:freq       |How often to sync|60m5m, 1h, 30d|
+|zz:freq       |How often to sync|60m|5m, 1h, 30d|
 |zz:keep_local |Local retention window|7d1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
 
