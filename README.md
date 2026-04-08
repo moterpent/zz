@@ -64,8 +64,41 @@ Remove zz management but keep your data.
 ```bash
 zz forget tank/data
 ```
+### 6. Manual Updates & Meta
+Update a setting without re-initializing:
+```bash
+zz set tank/data freq 15m
+```
+### 7. View the current "contract" for a specific dataset:
+```bash
+zz meta tank/data
+```
 
-⚙️ Configuration (The Contract)
+## Command Line Usage
+```
+usage: zz [-h] <command> ...
+
+Zeasy: Simplified ZFS Replication
+
+options:
+  -h, --help  show this help message and exit
+
+Commands:
+  <command>
+    init      Setup replication [dataset] [remote] [--freq] [--keep-local] [--keep-remote] [--keep-min]
+    sync      Run incremental sync [dataset] [--force]
+    status    Show health of all managed datasets
+    meta      View configuration contract [dataset]
+    set       Update properties [dataset] [prop] [value]
+    forget    Stop tracking a dataset [dataset]
+    restore   Recover from remote [remote] [local_dataset] [--latest]
+
+Examples:
+  zz init tank/data backup:pool/data --freq 1h
+  zz restore backup:pool/data tank/data --latest
+```
+
+## ⚙️ Configuration (The Contract)
 zz stores configuration in ZFS user properties. The settings move with the dataset.
 
 |Property     |Description|Default|Example|
@@ -75,16 +108,8 @@ zz stores configuration in ZFS user properties. The settings move with the datas
 |zz:keep_local |Local retention window|7d|1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
 
-Manual Updates & Meta
-Update a setting without re-initializing:
-```bash
-zz set tank/data freq 15m
-```
-View the current "contract" for a specific dataset:
-```bash
-zz meta tank/data
-```
-⚠️ Important Notes
+
+## ⚠️ Important Notes
 * **Snapshots:** zz only manages snapshots prefixed with @zz_auto_.
 * **Remote Integrity:** zz uses incremental sends without the -F (Force) flag. Do
   not modify the remote dataset directly (keep it readonly=on) to avoid stream
@@ -94,4 +119,6 @@ divergence.
 nearest minute to prevent the schedule from slowly drifting forward.📄
 
 License: 
-MIT License - Keep it Zeasy.
+MIT License
+
+Keep it Zeasy.
