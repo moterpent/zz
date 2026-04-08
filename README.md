@@ -48,7 +48,8 @@ View health, last sync time, and countdown for all managed datasets:
 zz status
 ```
 
-### 4. Disaster Recovery (Restore)Recreate a lost dataset from the remote (includes all metadata and history):
+### 4. Disaster Recovery (Restore)
+Recreate a lost dataset from the remote (includes all metadata and history):
 ```bash
 zz restore backup-server:pool/data tank/data
 ```
@@ -61,11 +62,13 @@ zz forget tank/data
 
 ⚙️ Configuration (The Contract)
 zz stores configuration in ZFS user properties. The settings move with the dataset.
-|Property     |Description|Default|Example
-zz:target     |Remote SSH target and path|-|192.168.60.62:tank/test
-zz:freqi      |How often to sync|60m5m, 1h, 30d
-zz:keep_local |Local retention window|7d1h, 2h, 1d
-zz:keep_remote|Remote retention window|30d|24h, 30d, 1y
+
+|Property     |Description|Default|Example|
+|-------------|---------------|-------------------|-------------|
+|zz:target     |Remote SSH target and path|-|192.168.60.62:tank/test|
+|zz:freq       |How often to sync|60m5m, 1h, 30d|
+|zz:keep_local |Local retention window|7d1h, 2h, 1d|
+|zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
 
 Manual Updates & Meta
 Update a setting without re-initializing:
