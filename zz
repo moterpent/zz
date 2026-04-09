@@ -124,6 +124,15 @@ def run_init(args):
     remote_host, remote_path = args.remote.split(':')
     remote_pool = remote_path.split('/')[0]
     
+    # Init also respects local lock
+    lock_path = f"/tmp/zz_{args.dataset.replace('/', '_')}.lock"
+    lock_f = open(lock_path, 'w')
+    try:
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print(f"[*] {args.dataset} is already being processed locally. Skipping.", flush=True)
+        return
+
     if is_remote_busy(remote_host, args.dataset):
         print(f"[*] {args.dataset} is currently busy (remote recv). Skipping.", flush=True); return
 
@@ -161,14 +170,20 @@ def run_sync(args):
     for name in names:
         ds = ZzDataset(name)
         if not ds or not ds.props or ds.target == "-": continue
+        
+        # LOCAL LOCK CHECK FIRST - No network touch if busy
         lock_path = f"/tmp/zz_{name.replace('/', '_')}.lock"
         lock_f = open(lock_path, 'w')
-        try: fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except IOError: continue 
+        try: 
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except IOError:
+            print(f"[*] {name}: Sync already in progress (Local Lock). Skipping.", flush=True)
+            lock_f.close(); continue 
 
         remote_host, remote_path = ds.target.split(':')
         remote_pool = remote_path.split('/')[0]
 
+        # Double check remote only if we have the local lock
         if is_remote_busy(remote_host, name):
             if sys.stdin.isatty(): print(f"    [-] {name} is currently busy (remote recv). Skipping.", flush=True)
             lock_f.close(); continue
@@ -284,7 +299,7 @@ def run_meta(args):
     for d, k, p in fields:
         val = ds.props.get(p, "-")
         if k in ['freq', 'keep_local', 'keep_remote'] and val != "-": val = human_duration(parse_duration(val))
-        print(f"{d:<22} | {k:<12} | {val}")
+        print(f"{d:<22} | {k:<12} | {val}", flush=True)
 
 def run_set(args):
     ds = ZzDataset(args.dataset)
