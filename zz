@@ -92,8 +92,6 @@ def run_prune(ds, remote_host=None):
     prop_name = "zz:keep_remote" if is_remote else "zz:keep_local"
     retention_sec = parse_duration(ds.props.get(prop_name, "7d"))
     keep_min = int(ds.props.get("zz:keep_min", "10"))
-    label = f"remote ({remote_host})" if is_remote else "local"
-    print(f"    [*] Pruning {label}...")
     
     cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name,creation", "-p", "-S", "creation", ds.name]
     if is_remote: cmd = ["ssh", "-o", "BatchMode=yes", remote_host] + cmd
@@ -105,11 +103,15 @@ def run_prune(ds, remote_host=None):
         now = int(time.time())
         to_delete = [s[0] for s in snapshots[keep_min:] if (now - s[1]) > retention_sec]
         for snap in to_delete:
-            print(f"        [-] Destroying {snap}")
             del_cmd = ["zfs", "destroy", "-r", snap]
             if is_remote: del_cmd = ["ssh", remote_host] + del_cmd
             subprocess.run(del_cmd, check=True)
     except: pass
+
+def is_remote_busy(host, dataset):
+    """Checks if a zfs recv process is active for the dataset on the remote."""
+    check_cmd = f"ps -ef | grep 'zfs recv' | grep -v grep | grep '{dataset}'"
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", host, check_cmd], stdout=subprocess.DEVNULL).returncode == 0
 
 def run_init(args):
     ds = ZzDataset(args.dataset)
@@ -119,7 +121,11 @@ def run_init(args):
     remote_host, remote_path = args.remote.split(':')
     remote_pool = remote_path.split('/')[0]
     
-    # Check for resume token on remote before complaining about existing dataset
+    # 1. Check for Active Sync
+    if is_remote_busy(remote_host, args.dataset):
+        print(f"[*] {args.dataset} is currently being received by another process. Skipping."); return
+
+    # 2. Check for Resume Token
     try:
         res = subprocess.check_output(["ssh", "-o", "BatchMode=yes", remote_host, 
                                      f"zfs get -H -o value receive_resume_token {args.dataset}"], 
@@ -128,23 +134,17 @@ def run_init(args):
     except: token = "-"
 
     if token != "-":
-        print(f"[*] Found a partial initial sync on remote. Resuming...")
+        print(f"[*] Found partial initial sync on remote. Resuming...")
         send_cmd = ["zfs", "send", "-v", "-t", token]
         recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
         if run_transfer(send_cmd, recv_cmd) == 0:
-            ds.set_prop("target", args.remote)
-            ds.set_prop("freq", args.freq)
-            ds.set_prop("last_sync", int(time.time()))
+            ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq); ds.set_prop("last_sync", int(time.time()))
             print("[+] Resume successful. Init complete.")
         return
 
-    # Standard Init
-    ds.set_prop("target", args.remote)
-    ds.set_prop("freq", args.freq)
-    ds.set_prop("keep_local", args.keep_local)
-    ds.set_prop("keep_remote", args.keep_remote)
-    ds.set_prop("keep_min", args.keep_min)
-
+    # 3. Standard Init
+    ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq)
+    ds.set_prop("keep_local", args.keep_local); ds.set_prop("keep_remote", args.keep_remote); ds.set_prop("keep_min", args.keep_min)
     snap = f"zz_auto_{int(time.time())}"
     subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], check=True)
     
@@ -152,10 +152,8 @@ def run_init(args):
     send_cmd = ["zfs", "send", "-R", "-v", f"{args.dataset}@{snap}"]
     recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
     if run_transfer(send_cmd, recv_cmd) == 0:
-        ds.set_prop("last_sync", int(time.time()))
-        print("[+] Init successful.")
-    else:
-        print("[!] Transfer interrupted. Run again to resume.")
+        ds.set_prop("last_sync", int(time.time())); print("[+] Init successful.")
+    else: print("[!] Transfer interrupted. Run again to resume.")
 
 def run_sync(args):
     names = [args.dataset] if args.dataset else get_managed_datasets()
@@ -170,6 +168,11 @@ def run_sync(args):
         remote_host, remote_path = ds.target.split(':')
         remote_pool = remote_path.split('/')[0]
 
+        # Skip if busy
+        if is_remote_busy(remote_host, name):
+            if sys.stdin.isatty(): print(f"    [-] {name} is currently busy (remote recv). Skipping.")
+            lock_f.close(); continue
+
         try:
             res = subprocess.check_output(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs get -H -o value receive_resume_token {name}"], encoding='utf-8')
             token = res.strip()
@@ -182,8 +185,7 @@ def run_sync(args):
             if run_transfer(send_cmd, recv_cmd) != 0:
                 lock_f.close(); continue
 
-        now_ts = int(time.time())
-        freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
+        now_ts = int(time.time()); freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
         if (now_ts - ds.last_sync) < 60 and not args.force: lock_f.close(); continue
         if not args.force and (now_ts - ds.last_sync) < (freq_sec - 5): lock_f.close(); continue
 
@@ -201,7 +203,6 @@ def run_sync(args):
 
         cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name", "-s", "creation", ds.name]
         local_list = subprocess.check_output(cmd, encoding='utf-8').strip().split('\n')
-        
         pending = []
         found_bridge = False
         for s in local_list:
@@ -234,7 +235,6 @@ def run_restore(args):
     remote_host, remote_ds = args.remote.split(':')
     local_ds = args.local_dataset
     local_pool = local_ds.split('/')[0]
-    print(f"[*] Starting Recovery: {args.remote} -> {local_ds}")
     try:
         cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {remote_ds} && zfs get all -H -o property,value {remote_ds}"]
         res = subprocess.check_output(cmd, encoding='utf-8')
@@ -302,8 +302,6 @@ def main():
     pa = subparsers.add_parser('abort', help='Clear resume tokens'); pa.add_argument('dataset'); pa.set_defaults(func=run_abort)
     pf = subparsers.add_parser('forget', help='Stop tracking'); pf.add_argument('dataset'); pf.set_defaults(func=run_forget)
     pr = subparsers.add_parser('restore', help='Recover'); pr.add_argument('remote'); pr.add_argument('local_dataset'); pr.add_argument('--latest', action='store_true'); pr.set_defaults(func=run_restore)
-    args = parser.parse_args()
-    if hasattr(args, 'func'): args.func(args)
-    else: parser.print_help()
+    args = parser.parse_args(); (args.func(args) if hasattr(args, 'func') else parser.print_help())
 
 if __name__ == "__main__": main()
