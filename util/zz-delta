@@ -4,29 +4,35 @@
 
 prev_ts=0
 
-# Print Header
-printf "%-15s | %-22s | %-10s | %-10s\n" "SNAPSHOT_TAG" "TIMESTAMP" "DELTA" "HUMAN"
-echo "---------------------------------------------------------------------------"
+# Updated Header to include USED
+printf "%-15s | %-22s | %-8s | %-10s | %-10s\n" "SNAPSHOT_TAG" "TIMESTAMP" "USED" "DELTA" "HUMAN"
+echo "---------------------------------------------------------------------------------------"
 
 while read -r line; do
     # Filter for zz_auto snapshots
     if [[ "$line" == *"@zz_auto_"* ]]; then
-        # Extract the integer timestamp
+        # Extract the integer timestamp from the name
         ts=$(echo "$line" | grep -oP '(?<=@zz_auto_)[0-9]+')
         
+        # Extract the USED value (2nd column in standard zfs list output)
+        used=$(echo "$line" | awk '{print $2}')
+        
         # Convert Unix TS to readable date
-        # Use 'date -d @ts' for Linux/GNU or 'date -r ts' for BSD/macOS
         readable_date=$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$ts" "+%Y-%m-%d %H:%M:%S")
 
         if [ "$prev_ts" -eq 0 ]; then
             # First snapshot in the set
-            printf "%-15s | %-22s | %-10s | %-10s\n" "$ts" "$readable_date" "---" "Initial"
+            printf "%-15s | %-22s | %-8s | %-10s | %-10s\n" "$ts" "$readable_date" "$used" "---" "Initial"
         else
             # Calculate difference
             delta=$((ts - prev_ts))
             
             # Format human delta
-            if [ $delta -ge 60 ]; then
+            if [ $delta -ge 3600 ]; then
+                hrs=$((delta / 3600))
+                min=$(((delta % 3600) / 60))
+                human="${hrs}h ${min}m"
+            elif [ $delta -ge 60 ]; then
                 min=$((delta / 60))
                 sec=$((delta % 60))
                 human="${min}m ${sec}s"
@@ -34,7 +40,7 @@ while read -r line; do
                 human="${delta}s"
             fi
             
-            printf "%-15s | %-22s | %-10s | %-10s\n" "$ts" "$readable_date" "${delta}s" "$human"
+            printf "%-15s | %-22s | %-8s | %-10s | %-10s\n" "$ts" "$readable_date" "$used" "${delta}s" "$human"
         fi
         prev_ts=$ts
     fi
