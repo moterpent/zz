@@ -6,6 +6,7 @@ import time
 import datetime
 import os
 import fcntl
+import re
 
 # --- Helpers ---
 
@@ -70,15 +71,31 @@ def get_managed_datasets():
 
 # --- Actions ---
 
-def is_local_busy(dataset):
-    """Check process table for active ZFS operations on this dataset."""
-    cmd = f"ps -ef | grep -E 'zfs (send|recv|receive)' | grep -v grep | grep '{dataset}'"
-    return subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL).returncode == 0
+def get_token(host, dataset):
+    """Retrieves the raw resume token from the remote host."""
+    try:
+        cmd = ["ssh", "-o", "BatchMode=yes", host, f"zfs get -H -o value receive_resume_token {dataset}"]
+        res = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
+        return res.strip()
+    except:
+        return "-"
 
-def is_remote_busy(host, dataset):
-    """Check remote process table for active ZFS operations on this dataset."""
-    check_cmd = f"ps -ef | grep -E 'zfs (send|recv|receive)' | grep -v grep | grep '{dataset}'"
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", host, check_cmd], stdout=subprocess.DEVNULL).returncode == 0
+def is_token_active(host, dataset):
+    """Checks if the resume token is actually growing/changing."""
+    t1 = get_token(host, dataset)
+    if t1 == "-": return False
+    
+    # Wait to see if the token (which includes offset/bytes) changes
+    time.sleep(3)
+    
+    t2 = get_token(host, dataset)
+    return t1 != t2
+
+def is_busy_local(dataset):
+    """Broad local process check using hardened ps."""
+    ds_regex = dataset.replace('/', r'\/')
+    check_cmd = f"ps -Aww -o args | grep -E 'zfs .*(send|recv|receive).* {ds_regex}' | grep -v grep"
+    return subprocess.run(check_cmd, shell=True, stdout=subprocess.DEVNULL).returncode == 0
 
 def run_transfer(send_cmd, recv_cmd):
     sys.stdout.flush()
@@ -130,18 +147,12 @@ def run_init(args):
     remote_host, remote_path = args.remote.split(':')
     remote_pool = remote_path.split('/')[0]
     
-    if is_local_busy(args.dataset) or is_remote_busy(remote_host, args.dataset):
+    if is_busy_local(args.dataset) or is_token_active(remote_host, args.dataset):
         print(f"[*] {args.dataset}: Transfer already active. Skipping.", flush=True); return
 
-    try:
-        res = subprocess.check_output(["ssh", "-o", "BatchMode=yes", remote_host, 
-                                     f"zfs get -H -o value receive_resume_token {args.dataset}"], 
-                                     encoding='utf-8', stderr=subprocess.DEVNULL)
-        token = res.strip()
-    except: token = "-"
-
+    token = get_token(remote_host, args.dataset)
     if token != "-":
-        print(f"[*] Found partial initial sync on remote. Resuming...", flush=True)
+        print(f"[*] Resuming initial sync...", flush=True)
         send_cmd = ["zfs", "send", "-v", "-t", token]
         recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
         if run_transfer(send_cmd, recv_cmd) == 0:
@@ -168,17 +179,18 @@ def run_sync(args):
         ds = ZzDataset(name)
         if not ds or not ds.props or ds.target == "-": continue
         
-        # 1. PARANOID PROCESS CHECK - Most reliable
-        if is_local_busy(name):
-            print(f"[*] {name}: Active ZFS process detected locally. Skipping.", flush=True); continue
-
         remote_host, remote_path = ds.target.split(':')
         remote_pool = remote_path.split('/')[0]
 
-        if is_remote_busy(remote_host, name):
-            print(f"[*] {name}: Active ZFS process detected on remote. Skipping.", flush=True); continue
+        # 1. Broad Local Process Check
+        if is_busy_local(name):
+            print(f"[*] {name}: Active ZFS process detected locally. Skipping.", flush=True); continue
+        
+        # 2. Token Activity Check (Checks for growth)
+        if is_token_active(remote_host, name):
+            print(f"[*] {name}: Active remote sync detected (Token growth). Skipping.", flush=True); continue
 
-        # 2. FILE LOCK - Secondary safety
+        # 3. Local File Lock
         lock_path = f"/tmp/zz_{name.replace('/', '_')}.lock"
         lock_f = open(lock_path, 'w')
         try: 
@@ -187,22 +199,24 @@ def run_sync(args):
             print(f"[*] {name}: Local file lock held. Skipping.", flush=True)
             lock_f.close(); continue 
 
-        try:
-            res = subprocess.check_output(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs get -H -o value receive_resume_token {name}"], encoding='utf-8')
-            token = res.strip()
-        except: token = "-"
-
+        # 4. Check for resume tokens
+        token = get_token(remote_host, name)
         if token != "-":
-            print(f"[*] Resuming interrupted transfer for {ds.name}...", flush=True)
+            # RE-CHECK: verify growth one last time
+            if is_token_active(remote_host, name):
+                lock_f.close(); continue
+                
+            print(f"[*] {name}: Resuming interrupted transfer...", flush=True)
             send_cmd = ["zfs", "send", "-v", "-t", token]
             recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
             if run_transfer(send_cmd, recv_cmd) != 0:
                 lock_f.close(); continue
 
+        # 5. Standard timing checks
         now_ts = int(time.time()); freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
-        if ds.last_sync > 0:
-            if (now_ts - ds.last_sync) < 60 and not args.force: lock_f.close(); continue
-            if not args.force and (now_ts - ds.last_sync) < (freq_sec - 5): lock_f.close(); continue
+        if ds.last_sync > 0 and not args.force:
+            if (now_ts - ds.last_sync) < 60: lock_f.close(); continue
+            if (now_ts - ds.last_sync) < (freq_sec - 5): lock_f.close(); continue
 
         print(f"[*] Processing {ds.name}...", flush=True)
         time.sleep(1.2)
