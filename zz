@@ -186,8 +186,9 @@ def run_sync(args):
                 lock_f.close(); continue
 
         now_ts = int(time.time()); freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
-        if (now_ts - ds.last_sync) < 60 and not args.force: lock_f.close(); continue
-        if not args.force and (now_ts - ds.last_sync) < (freq_sec - 5): lock_f.close(); continue
+        if ds.last_sync > 0:
+            if (now_ts - ds.last_sync) < 60 and not args.force: lock_f.close(); continue
+            if not args.force and (now_ts - ds.last_sync) < (freq_sec - 5): lock_f.close(); continue
 
         print(f"[*] Processing {ds.name}...", flush=True)
         time.sleep(1.2)
@@ -235,6 +236,7 @@ def run_restore(args):
     remote_host, remote_ds = args.remote.split(':')
     local_ds = args.local_dataset
     local_pool = local_ds.split('/')[0]
+    print(f"[*] Starting Recovery: {args.remote} -> {local_ds}", flush=True)
     try:
         cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {remote_ds} && zfs get all -H -o property,value {remote_ds}"]
         res = subprocess.check_output(cmd, encoding='utf-8')
@@ -250,6 +252,7 @@ def run_restore(args):
         ds = ZzDataset(local_ds)
         for pk, pv in remote_props.items(): ds.set_prop(pk.split(':')[1], pv)
         ds.set_prop("target", args.remote); ds.set_prop("last_sync", int(time.time()))
+        print(f"[+] Done.", flush=True)
 
 def run_status(args):
     managed = get_managed_datasets()
@@ -258,11 +261,15 @@ def run_status(args):
     print("-" * 75, flush=True)
     for name in managed:
         ds = ZzDataset(name)
-        now = int(time.time()); gap = now - ds.last_sync
-        freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
-        status = "OK" if gap < freq_sec else "DELAYED"
-        last_str = str(datetime.timedelta(seconds=gap)).split('.')[0] + " ago"
-        next_run = "DUE NOW" if gap >= freq_sec else str(datetime.timedelta(seconds=freq_sec-gap)).split('.')[0]
+        now = int(time.time())
+        if ds.last_sync == 0:
+            status, last_str, next_run = "INIT", "NEVER", "PENDING"
+        else:
+            gap = now - ds.last_sync
+            freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
+            status = "OK" if gap < freq_sec else "DELAYED"
+            last_str = "UNKNOWN" if gap > 86400 * 365 else str(datetime.timedelta(seconds=gap)).split('.')[0] + " ago"
+            next_run = "DUE NOW" if gap >= freq_sec else str(datetime.timedelta(seconds=freq_sec-gap)).split('.')[0]
         print(f"{name:<20} | {status:<10} | {last_str:<18} | {next_run}", flush=True)
 
 def run_meta(args):
@@ -277,7 +284,7 @@ def run_meta(args):
     for d, k, p in fields:
         val = ds.props.get(p, "-")
         if k in ['freq', 'keep_local', 'keep_remote'] and val != "-": val = human_duration(parse_duration(val))
-        print(f"{d:<22} | {k:<12} | {val}", flush=True)
+        print(f"{d:<22} | {k:<12} | {val}")
 
 def run_set(args):
     ds = ZzDataset(args.dataset)
