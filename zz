@@ -177,12 +177,40 @@ def run_sync(args):
         remote_host, remote_path = ds.target.split(':')
         remote_pool = remote_path.split('/')[0]
 
-        if is_busy_local(name):
-            print(f"[*] {name}: Active ZFS process detected locally. Skipping.", flush=True); continue
+        # --- PHASE 1: THE SNAPSHOT (CATCH-UP LOGIC) ---
+        now_ts = int(time.time())
+        freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
         
-        if is_token_active(remote_host, name):
-            print(f"[*] {name}: Active remote sync detected (Token growth). Skipping.", flush=True); continue
+        # We check if it's time to take a NEW snapshot. 
+        # We use a 30s buffer to help align with cron's 5m intervals.
+        if (now_ts - ds.last_sync) >= (freq_sec - 30) or args.force:
+            new_snap_tag = f"zz_auto_{now_ts}"
+            print(f"[*] {name}: Taking scheduled snapshot @{new_snap_tag}...", flush=True)
+            try:
+                subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
+                # We update last_sync NOW so we don't double-snap if the transfer takes a long time
+                ds.set_prop("last_sync", now_ts)
+            except subprocess.CalledProcessError:
+                print(f"[!] Failed to take snapshot for {name}. Skipping transfer.", flush=True)
+                continue
+        else:
+            # If it's not time for a new snap, we might still have 'pending' ones from a previous 
+            # run that was busy. We proceed to Phase 2 to check.
+            pass
 
+        # --- PHASE 2: THE TRANSFER (BUSY CHECKS) ---
+        
+        # Check if local ZFS processes are already touching this dataset
+        if is_busy_local(name):
+            print(f"[*] {name}: Active ZFS process detected. New snap is safe; will sync later.", flush=True)
+            continue
+        
+        # Check if a remote resume token is currently growing (active transfer)
+        if is_token_active(remote_host, name):
+            print(f"[*] {name}: Remote sync currently active. Skipping.", flush=True)
+            continue
+
+        # File-based lock to prevent two 'zz' instances from colliding
         lock_path = f"/tmp/zz_{name.replace('/', '_')}.lock"
         lock_f = open(lock_path, 'w')
         try: 
@@ -191,57 +219,66 @@ def run_sync(args):
             print(f"[*] {name}: Local file lock held. Skipping.", flush=True)
             lock_f.close(); continue 
 
+        # --- PHASE 3: DELTA DISCOVERY ---
+
+        # Handle interrupted/resumable transfers first
         token = get_token(remote_host, name)
         if token != "-":
-            if is_token_active(remote_host, name):
-                lock_f.close(); continue
             print(f"[*] {name}: Resuming interrupted transfer...", flush=True)
             send_cmd = ["zfs", "send", "-v", "-t", token]
             recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
             if run_transfer(send_cmd, recv_cmd) != 0:
                 lock_f.close(); continue
 
-        now_ts = int(time.time()); freq_sec = parse_duration(ds.props.get("zz:freq", "60m"))
-        if ds.last_sync > 0 and not args.force:
-            if (now_ts - ds.last_sync) < 60: lock_f.close(); continue
-            if (now_ts - ds.last_sync) < (freq_sec - 5): lock_f.close(); continue
-
-        print(f"[*] Processing {ds.name}...", flush=True)
-        time.sleep(1.2)
-        new_snap_tag = f"zz_auto_{int(time.time())}"
-        subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
-
+        # Identify the "Bridge" (latest common snapshot)
         try:
             cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {ds.name}"]
             res = subprocess.check_output(cmd, encoding='utf-8')
             remote_snaps = [l.strip().split('@')[1] for l in res.strip().split('\n') if "@zz_auto_" in l]
+            if not remote_snaps:
+                print(f"[!] No automated snapshots found on remote for {name}.", flush=True)
+                lock_f.close(); continue
             bridge = remote_snaps[0]
-        except: lock_f.close(); continue
+        except: 
+            print(f"[!] Could not retrieve remote snapshot list for {name}.", flush=True)
+            lock_f.close(); continue
 
+        # Build the list of snapshots that exist locally but not on remote
         cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name", "-s", "creation", ds.name]
         local_list = subprocess.check_output(cmd, encoding='utf-8').strip().split('\n')
+        
         pending = []
         found_bridge = False
         for s in local_list:
-            tag = s.split('@')[1] if '@' in s else ""
-            if tag == bridge: found_bridge = True; continue
-            if found_bridge and "@zz_auto_" in s: pending.append(tag)
+            if '@' not in s: continue
+            tag = s.split('@')[1]
+            if tag == bridge: 
+                found_bridge = True
+                continue
+            if found_bridge and "@zz_auto_" in s:
+                pending.append(tag)
 
-        current_base = bridge
-        success = True
-        for next_tag in pending:
-            print(f"    [*] Sending @{current_base} -> @{next_tag}", flush=True)
-            send_cmd = ["zfs", "send", "-R", "-v", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
-            recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
-            if run_transfer(send_cmd, recv_cmd) != 0:
-                success = False; break
-            current_base = next_tag
+        # --- PHASE 4: THE SEND ---
+        if not pending:
+            print(f"[*] {name}: Remote is already up to date.", flush=True)
+        else:
+            current_base = bridge
+            for next_tag in pending:
+                print(f"    [*] Sending {name}: @{current_base} -> @{next_tag}", flush=True)
+                send_cmd = ["zfs", "send", "-R", "-v", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
+                recv_cmd = ["ssh", remote_host, f"zfs recv -s -du {remote_pool}"]
+                
+                if run_transfer(send_cmd, recv_cmd) != 0:
+                    print(f"[!] Transfer failed at @{next_tag}. Will resume later.", flush=True)
+                    break
+                current_base = next_tag
 
-        if success:
-            ds.set_prop("last_sync", int(time.time()))
-            run_prune(ds); run_prune(ds, remote_host)
+        # Always try to prune after a successful check/sync
+        run_prune(ds)
+        run_prune(ds, remote_host)
         
-        fcntl.flock(lock_f, fcntl.LOCK_UN); lock_f.close()
+        fcntl.flock(lock_f, fcntl.LOCK_UN)
+        lock_f.close()
 
 def run_forget(args):
     ds = ZzDataset(args.dataset)
