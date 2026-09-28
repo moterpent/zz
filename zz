@@ -110,8 +110,13 @@ def run_transfer(send_cmd, recv_cmd):
         recv_proc.communicate()
         return recv_proc.returncode
 
-def run_prune(ds, remote_host=None):
+def run_prune(ds, remote_host=None, bridge=None):
     is_remote = remote_host is not None
+    # Local pruning must know the latest snapshot on the remote. Anything at or newer
+    # than it is unsent (or is the incremental base) and must never be destroyed.
+    if not is_remote and not bridge:
+        print(f"    [!] Skipping local prune: latest remote snapshot unknown.", flush=True)
+        return
     prop_name = "zz:keep_remote" if is_remote else "zz:keep_local"
     retention_sec = parse_duration(ds.props.get(prop_name, "7d"))
     keep_min = int(ds.props.get("zz:keep_min", "10"))
@@ -125,8 +130,16 @@ def run_prune(ds, remote_host=None):
         res = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
         snapshots = [(l.split('\t')[0], int(l.split('\t')[1])) for l in res.strip().split('\n') if "@zz_auto_" in l]
         if len(snapshots) <= keep_min: return
+        candidates = snapshots[keep_min:]
+        if not is_remote:
+            tags = [s[0].split('@')[1] for s in snapshots]
+            if bridge not in tags:
+                print(f"    [!] Skipping local prune: bridge @{bridge} not found locally.", flush=True)
+                return
+            # snapshots is newest-first, so only those after the bridge are older than it
+            candidates = snapshots[max(keep_min, tags.index(bridge) + 1):]
         now = int(time.time())
-        to_delete = [s[0] for s in snapshots[keep_min:] if (now - s[1]) > retention_sec]
+        to_delete = [s[0] for s in candidates if (now - s[1]) > retention_sec]
         for snap in to_delete:
             print(f"        [-] Destroying {snap}", flush=True)
             del_cmd = ["zfs", "destroy", "-r", snap]
@@ -258,11 +271,16 @@ def run_sync(args):
             if found_bridge and "@zz_auto_" in s:
                 pending.append(tag)
 
+        if not found_bridge:
+            print(f"[!] {name}: Latest remote snapshot @{bridge} does not exist locally. "
+                  f"Incremental sync is impossible; manual intervention required. Skipping.", flush=True)
+            lock_f.close(); continue
+
         # --- PHASE 4: THE SEND ---
+        current_base = bridge
         if not pending:
             print(f"[*] {name}: Remote is already up to date.", flush=True)
         else:
-            current_base = bridge
             for next_tag in pending:
                 print(f"    [*] Sending {name}: @{current_base} -> @{next_tag}", flush=True)
                 send_cmd = ["zfs", "send", "-R", "-v", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
@@ -274,7 +292,8 @@ def run_sync(args):
                 current_base = next_tag
 
         # Always try to prune after a successful check/sync
-        run_prune(ds)
+        # current_base is the newest snapshot confirmed on the remote
+        run_prune(ds, bridge=current_base)
         run_prune(ds, remote_host)
         
         fcntl.flock(lock_f, fcntl.LOCK_UN)
