@@ -48,10 +48,20 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```
 
 ### 3. Check Status
-View health, last sync time, and countdown for all managed datasets:
+View replication health for all managed datasets:
 ```bash
 zz status
 ```
+```
+DATASET              | STATUS   | LAST SNAP          | LAG              | NEXT SNAP
+------------------------------------------------------------------------------------------
+tank/data            | OK       | 0:12:40 ago        | 0:12:40          | 0:47:20
+```
+* **LAST SNAP**: when the most recent snapshot was taken locally.
+* **LAG**: age of the newest snapshot confirmed on the remote, i.e. how far behind the replica is.
+* **STATUS**: `OK`; `LAGGING` (lag over 2× freq + 5m); `STALLED` (lag over max(1 day, 4× freq)); `ERROR` (the last sync attempt failed; the reason is listed below the table); `INIT`; or `UNKNOWN` (no sync recorded yet).
+
+`zz status` and `zz sync` exit non-zero when anything is unhealthy or failed, so either can drive monitoring or cron alerts.
 
 ### 4. Disaster Recovery (Restore)
 Recreate a lost dataset from the remote (includes all metadata and history):
@@ -101,7 +111,7 @@ Examples:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.1.0 (2b6ae23)
+zz 0.2.0 (42c3fae)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
@@ -114,6 +124,9 @@ zz stores configuration in ZFS user properties. The settings move with the datas
 |zz:freq       |How often to sync|60m|5m, 1h, 30d|
 |zz:keep_local |Local retention window|7d|1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
+|zz:last_sync  |Time of last local snapshot (managed by zz)|-|1790626501|
+|zz:last_sent  |Time of newest snapshot confirmed on remote (managed by zz)|-|1790626501|
+|zz:last_error |Last sync failure, cleared on success (managed by zz)|-|1790626501 Could not retrieve...|
 
 
 ## ⚠️ Important Notes
