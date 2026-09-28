@@ -124,6 +124,7 @@ zz stores configuration in ZFS user properties. The settings move with the datas
 |zz:freq       |How often to sync|60m|5m, 1h, 30d|
 |zz:keep_local |Local retention window|7d|1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
+|zz:keep_min   |Safety floor: newest N snapshots never pruned, on either side, regardless of age|10|24|
 |zz:last_sync  |Time of last local snapshot (managed by zz)|-|1790626501|
 |zz:last_sent  |Time of newest snapshot confirmed on remote (managed by zz)|-|1790626501|
 |zz:last_error |Last sync failure, cleared on success (managed by zz)|-|1790626501 Could not retrieve...|
