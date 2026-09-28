@@ -68,6 +68,9 @@ Recreate a lost dataset from the remote (includes all metadata and history):
 ```bash
 zz restore backup-server:pool/data tank/data
 ```
+* Restores the newest `zz_auto_` snapshot with its full history (`--latest` for just that snapshot), mounts it, and makes it the managed primary again; the next `zz sync` resumes replication incrementally.
+* If a restore is interrupted, run the same command again to resume it.
+* Refuses to overwrite an existing dataset. Restoring to a different name while the original still replicates to that remote leaves the copy unmanaged.
 
 ### 5. Stop Tracking (Forget)
 Remove zz management but keep your data.
@@ -111,7 +114,7 @@ Examples:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.2.0 (42c3fae)
+zz 0.3.0 (893f011)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
@@ -120,7 +123,7 @@ zz stores configuration in ZFS user properties. The settings move with the datas
 
 |Property     |Description|Default|Example|
 |-------------|---------------|-------------------|-------------|
-|zz:target     |Remote SSH target and path|-|192.168.60.62:tank/test|
+|zz:target     |Remote host and the exact dataset to replicate into (parents are created by init)|-|backup:pool/backups/data|
 |zz:freq       |How often to sync|60m|5m, 1h, 30d|
 |zz:keep_local |Local retention window|7d|1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
