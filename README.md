@@ -51,7 +51,7 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```
 Each run logs a header with the version and time, then one line per snapshot sent:
 ```
---- zz 0.3.2 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
+--- zz 0.3.3 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
 [*] tank/data: Taking scheduled snapshot @zz_auto_1790630101...
     [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
     [*] Pruning local...
@@ -63,6 +63,17 @@ Rotate the log with the included logrotate rule (weekly, 12 compressed weeks kep
 cp util/zz.logrotate /etc/logrotate.d/zz   # edit the path to match your cron line
 ```
 
+#### Snapshot on demand
+To take a snapshot and send it right away, without waiting for the next scheduled one:
+```bash
+zz sync tank/data --now      # --force is an alias
+```
+* Takes a snapshot now even if one isn't due, then runs a normal sync.
+* Doesn't move the schedule: the next scheduled snapshot comes when it otherwise would have. If a scheduled snapshot happens to be due anyway, only one is taken.
+* Doesn't force anything else. Locks, busy checks and errors (a diverged remote, a missing bridge snapshot) stop the sync exactly as without it, and the remote is never overwritten; zz never uses `zfs recv -F`.
+
+Useful for a checkpoint before risky changes, or to test a new setup without waiting a full interval.
+
 ### 3. Check Status
 View replication health for all managed datasets:
 ```bash
@@ -73,7 +84,7 @@ DATASET              | STATUS   | LAST SNAP          | LAG              | NEXT S
 ------------------------------------------------------------------------------------------
 tank/data            | OK       | 0:12:40 ago        | 0:12:40          | 0:47:20
 ```
-* **LAST SNAP**: when the most recent snapshot was taken locally.
+* **LAST SNAP**: when the most recent scheduled snapshot was taken (`--now` snapshots aren't counted here).
 * **LAG**: age of the newest snapshot confirmed on the remote, i.e. how far behind the replica is.
 * **STATUS**: `OK`; `LAGGING` (lag over 2× freq + 5m); `STALLED` (lag over max(1 day, 4× freq)); `ERROR` (the last sync attempt failed; the reason is listed below the table); `INIT`; or `UNKNOWN` (no sync recorded yet).
 
@@ -116,7 +127,7 @@ options:
 Commands:
   <command>
     init      Start replicating a dataset: <dataset> <host:pool/dataset> [--freq] [--keep-local] [--keep-remote] [--keep-min]
-    sync      Snapshot if due and send to the remote: [dataset] [--force]
+    sync      Snapshot if due and send to the remote: [dataset] [--now]
     status    Replication health of all managed datasets
     meta      Show a dataset's settings: <dataset>
     set       Change a setting: <dataset> <prop> <value>
@@ -135,7 +146,7 @@ Examples:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.3.1 (1334ac9)
+zz 0.3.3 (b59c7fd)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
@@ -151,7 +162,7 @@ Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`
 |zz:keep_local |Local retention window|7d|1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
 |zz:keep_min   |Safety floor: newest N snapshots never pruned, on either side, regardless of age|10|24|
-|zz:last_sync  |Time of last local snapshot (managed by zz)|-|1790626501|
+|zz:last_sync  |Time of last scheduled snapshot; the schedule counts from it (managed by zz)|-|1790626501|
 |zz:last_sent  |Time of newest snapshot confirmed on remote (managed by zz)|-|1790626501|
 |zz:last_error |Last sync failure, cleared on success (managed by zz)|-|1790626501 Could not retrieve...|
 

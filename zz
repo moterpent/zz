@@ -11,7 +11,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -347,13 +347,16 @@ def run_sync(args):
                 ds.record_error(f"Invalid setting, skipping: {e}"); failed = True; continue
 
             # The 30s allowance keeps a snapshot due on this cron run from slipping to the next.
-            if (now_ts - ds.last_sync) >= (freq_sec - 30) or args.force:
+            due = (now_ts - ds.last_sync) >= (freq_sec - 30)
+            if due or args.force:
                 new_snap_tag = f"zz_auto_{now_ts}"
-                print(f"[*] {name}: Taking scheduled snapshot @{new_snap_tag}...", flush=True)
+                kind = "scheduled" if due else "on-demand (--now)"
+                print(f"[*] {name}: Taking {kind} snapshot @{new_snap_tag}...", flush=True)
                 try:
                     subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
-                    # Update last_sync now so a long transfer doesn't cause a double snapshot
-                    ds.set_prop("last_sync", now_ts)
+                    # last_sync anchors the schedule, so only a due snapshot moves it; an on-demand
+                    # one leaves the cadence alone. Set it now so a long transfer can't double-snap.
+                    if due: ds.set_prop("last_sync", now_ts)
                 except subprocess.CalledProcessError:
                     ds.record_error("Failed to take snapshot. Skipping transfer."); failed = True
                     continue
@@ -645,7 +648,13 @@ def main():
     pi.add_argument('--freq', default='60m', type=duration_arg); pi.add_argument('--keep-local', default='7d', type=duration_arg)
     pi.add_argument('--keep-remote', default='30d', type=duration_arg); pi.add_argument('--keep-min', default='10', type=keep_min_arg)
     pi.set_defaults(func=run_init)
-    ps = subparsers.add_parser('sync', help='Snapshot if due and send to the remote: [dataset] [--force]'); ps.add_argument('dataset', nargs='?'); ps.add_argument('--force', action='store_true'); ps.set_defaults(func=run_sync)
+    ps = subparsers.add_parser('sync', help='Snapshot if due and send to the remote: [dataset] [--now]',
+                               description='Take a snapshot if one is due, send any unsent snapshots, and prune.')
+    ps.add_argument('dataset', nargs='?', help='only this dataset (default: all managed datasets)')
+    ps.add_argument('--now', '--force', dest='force', action='store_true',
+                    help="take a snapshot now even if one isn't due. It doesn't move the schedule, and "
+                         "locks, busy checks and errors still apply; the remote is never overwritten.")
+    ps.set_defaults(func=run_sync)
     subparsers.add_parser('status', help='Replication health of all managed datasets').set_defaults(func=run_status)
     pm = subparsers.add_parser('meta', help='Show a dataset\'s settings: <dataset>'); pm.add_argument('dataset'); pm.set_defaults(func=run_meta)
     pset = subparsers.add_parser('set', help='Change a setting: <dataset> <prop> <value>'); pset.add_argument('dataset'); pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min']); pset.add_argument('value'); pset.set_defaults(func=run_set)
