@@ -8,8 +8,13 @@ import os
 import fcntl
 import re
 import functools
+import shutil
+import threading
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
+
+# Root-only lock directory (not /tmp, where another user could plant a symlink)
+LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
 
 # --- Helpers ---
 
@@ -73,12 +78,29 @@ def parse_target(target):
         raise ValueError(f"Invalid remote '{target}': expected host:pool/dataset")
     return host, path.strip('/')
 
+def human_bytes(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T": return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
 def fmt_age(seconds):
     return str(datetime.timedelta(seconds=max(0, int(seconds))))
 
 def get_pv():
-    path = subprocess.run(["which", "pv"], capture_output=True, text=True).stdout.strip()
-    return path if path and os.path.exists(path) else None
+    return shutil.which("pv")
+
+def open_lock(name, kind):
+    """Open (creating if needed) the lock file for a dataset, refusing to follow symlinks."""
+    os.makedirs(LOCK_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(LOCK_DIR, f"{name.replace('/', '_')}.{kind}.lock")
+    return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), 'r+')
+
+def managed_dataset(name):
+    """ZzDataset for a managed dataset, or None after printing why not."""
+    ds = ZzDataset(name)
+    if ds.props is None: print(f"[!] Error: Dataset '{name}' not found.", flush=True); return None
+    if ds.target == "-": print(f"[!] Error: Dataset '{name}' is not managed by zz.", flush=True); return None
+    return ds
 
 # --- Core Logic ---
 
@@ -158,28 +180,57 @@ def is_token_active(host, dataset):
     return t1 != t2
 
 def is_busy_local(dataset):
-    """Local process check without the 'stray backslash' warning."""
-    # We use the raw dataset name. grep -E handles slashes fine without escapes.
-    check_cmd = f"ps -Aww -o args | grep -E 'zfs .*(send|recv|receive).* {dataset}(@| |$)' | grep -v grep"
-    return subprocess.run(check_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    """True if a local zfs send/receive process is working on this dataset."""
+    pattern = re.compile(r'(^|[\s/])zfs\s.*(send|recv|receive).*\s' + re.escape(dataset) + r'(@|\s|$)')
+    procs = subprocess.run(["ps", "-Aww", "-o", "args="], capture_output=True, text=True).stdout
+    return any(pattern.search(line) for line in procs.splitlines())
 
-def run_transfer(send_cmd, recv_cmd):
+# zfs send -R notes on stderr that are expected during incremental sends and not worth logging
+SEND_NOISE = ("because it was created after the destination snapshot",)
+
+def run_transfer(send_cmd, recv_cmd, summary=None):
+    """Pipe send into receive. Non-zero if either side failed.
+
+    Without summary: zfs's own progress output (and pv, if installed) is shown as-is.
+    With summary: the stream is relayed and counted, and one line reports the result.
+    """
     sys.stdout.flush()
-    pv_path = get_pv()
-    if pv_path:
+    if summary is None:
         send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
-        pv_proc = subprocess.Popen([pv_path, "-pterb"], stdin=send_proc.stdout, stdout=subprocess.PIPE)
-        recv_proc = subprocess.Popen(recv_cmd, stdin=pv_proc.stdout)
+        procs, stream = [send_proc], send_proc.stdout
+        pv_path = get_pv()
+        if pv_path:
+            pv_proc = subprocess.Popen([pv_path, "-pterb"], stdin=stream, stdout=subprocess.PIPE)
+            stream.close(); procs.append(pv_proc); stream = pv_proc.stdout
+        recv_proc = subprocess.Popen(recv_cmd, stdin=stream)
+        stream.close()
+        recv_proc.wait()
+        for p in procs: p.wait()
+        return recv_proc.returncode or send_proc.returncode
+
+    send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    recv_proc = subprocess.Popen(recv_cmd, stdin=subprocess.PIPE)
+    err = []
+    reader = threading.Thread(target=lambda: err.append(send_proc.stderr.read()))
+    reader.start()
+    total, start = 0, time.monotonic()
+    try:
+        while True:
+            chunk = send_proc.stdout.read(1 << 20)
+            if not chunk: break
+            recv_proc.stdin.write(chunk); total += len(chunk)
+    except BrokenPipeError: pass  # receiver exited early; its exit status reports why
+    finally:
+        try: recv_proc.stdin.close()
+        except BrokenPipeError: pass
         send_proc.stdout.close()
-        pv_proc.stdout.close()
-        recv_proc.communicate()
-        return recv_proc.returncode
-    else:
-        send_proc = subprocess.Popen(send_cmd, stdout=subprocess.PIPE)
-        recv_proc = subprocess.Popen(recv_cmd, stdin=send_proc.stdout)
-        send_proc.stdout.close()
-        recv_proc.communicate()
-        return recv_proc.returncode
+    recv_proc.wait(); send_proc.wait(); reader.join()
+    for line in b"".join(err).decode(errors="replace").splitlines():
+        if line.strip() and not any(n in line for n in SEND_NOISE): print(f"    {line}", flush=True)
+    rc = recv_proc.returncode or send_proc.returncode
+    if rc == 0:
+        print(f"    [+] Sent {summary}: {human_bytes(total)} in {time.monotonic() - start:.1f}s", flush=True)
+    return rc
 
 def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
     """Destroy expired zz_auto_ snapshots on one side. Returns True if pruning failed."""
@@ -271,36 +322,42 @@ def run_sync(args):
     if names is None: return True
     failed = False
     for name in names:
-        ds = ZzDataset(name)
-        if not ds or not ds.props or ds.target == "-": continue
-        
+        if args.dataset:
+            ds = managed_dataset(name)
+            if not ds: failed = True; continue
+        else:
+            ds = ZzDataset(name)
+            if not ds.props or ds.target == "-": continue
+
         try: remote_host, remote_path = parse_target(ds.target)
         except ValueError as e:
             ds.record_error(str(e)); failed = True; continue
         recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {remote_path}"]
 
         # --- PHASE 1: THE SNAPSHOT (CATCH-UP LOGIC) ---
-        now_ts = int(time.time())
-        try: freq_sec = ds_duration(ds, "freq", "60m")
-        except ValueError as e:
-            ds.record_error(f"Invalid setting, skipping: {e}"); failed = True; continue
-        
-        # We check if it's time to take a NEW snapshot. 
-        # We use a 30s buffer to help align with cron's 5m intervals.
-        if (now_ts - ds.last_sync) >= (freq_sec - 30) or args.force:
-            new_snap_tag = f"zz_auto_{now_ts}"
-            print(f"[*] {name}: Taking scheduled snapshot @{new_snap_tag}...", flush=True)
-            try:
-                subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
-                # We update last_sync NOW so we don't double-snap if the transfer takes a long time
-                ds.set_prop("last_sync", now_ts)
-            except subprocess.CalledProcessError:
-                ds.record_error("Failed to take snapshot. Skipping transfer."); failed = True
-                continue
-        else:
-            # If it's not time for a new snap, we might still have 'pending' ones from a previous 
-            # run that was busy. We proceed to Phase 2 to check.
-            pass
+        # Taken even while a transfer is running (it is sent later), so this uses its own
+        # short lock rather than the transfer lock. Re-read settings once the lock is held,
+        # in case another run just took the snapshot.
+        with open_lock(name, "snap") as snap_lock:
+            fcntl.flock(snap_lock, fcntl.LOCK_EX)
+            ds = ZzDataset(name)
+            now_ts = int(time.time())
+            try: freq_sec = ds_duration(ds, "freq", "60m")
+            except ValueError as e:
+                ds.record_error(f"Invalid setting, skipping: {e}"); failed = True; continue
+
+            # The 30s allowance keeps a snapshot due on this cron run from slipping to the next.
+            if (now_ts - ds.last_sync) >= (freq_sec - 30) or args.force:
+                new_snap_tag = f"zz_auto_{now_ts}"
+                print(f"[*] {name}: Taking scheduled snapshot @{new_snap_tag}...", flush=True)
+                try:
+                    subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
+                    # Update last_sync now so a long transfer doesn't cause a double snapshot
+                    ds.set_prop("last_sync", now_ts)
+                except subprocess.CalledProcessError:
+                    ds.record_error("Failed to take snapshot. Skipping transfer."); failed = True
+                    continue
+            # Otherwise there may still be pending snapshots from a run that was busy.
 
         # --- PHASE 2: THE TRANSFER (BUSY CHECKS) ---
         
@@ -315,11 +372,10 @@ def run_sync(args):
             continue
 
         # File-based lock to prevent two 'zz' instances from colliding
-        lock_path = f"/tmp/zz_{name.replace('/', '_')}.lock"
-        lock_f = open(lock_path, 'w')
-        try: 
+        lock_f = open_lock(name, "sync")
+        try:
             fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except IOError:
+        except OSError:
             print(f"[*] {name}: Local file lock held. Skipping.", flush=True)
             lock_f.close(); continue 
 
@@ -329,8 +385,8 @@ def run_sync(args):
         token = get_token(remote_host, remote_path)
         if token != "-":
             print(f"[*] {name}: Resuming interrupted transfer...", flush=True)
-            send_cmd = ["zfs", "send", "-v", "-t", token]
-            if run_transfer(send_cmd, recv_cmd) != 0:
+            send_cmd = ["zfs", "send", "-t", token]
+            if run_transfer(send_cmd, recv_cmd, summary=f"{name} (resumed)") != 0:
                 ds.record_error("Resume of interrupted transfer failed."); failed = True
                 lock_f.close(); continue
 
@@ -349,8 +405,11 @@ def run_sync(args):
 
         # Build the list of snapshots that exist locally but not on remote
         cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name", "-s", "creation", ds.name]
-        local_list = subprocess.check_output(cmd, encoding='utf-8').strip().split('\n')
-        
+        try: local_list = subprocess.check_output(cmd, encoding='utf-8').strip().split('\n')
+        except subprocess.CalledProcessError:
+            ds.record_error("Could not list local snapshots."); failed = True
+            lock_f.close(); continue
+
         pending = []
         found_bridge = False
         for s in local_list:
@@ -375,10 +434,8 @@ def run_sync(args):
             print(f"[*] {name}: Remote is already up to date.", flush=True)
         else:
             for next_tag in pending:
-                print(f"    [*] Sending {name}: @{current_base} -> @{next_tag}", flush=True)
-                send_cmd = ["zfs", "send", "-R", "-v", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
-                
-                if run_transfer(send_cmd, recv_cmd) != 0:
+                send_cmd = ["zfs", "send", "-R", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
+                if run_transfer(send_cmd, recv_cmd, summary=f"{name} @{current_base} -> @{next_tag}") != 0:
                     send_ok = False
                     break
                 current_base = next_tag
@@ -398,9 +455,10 @@ def run_sync(args):
     return failed
 
 def run_forget(args):
-    ds = ZzDataset(args.dataset)
-    if not ds or not ds.props: return
+    ds = managed_dataset(args.dataset)
+    if not ds: return True
     for prop in list(ds.props.keys()): subprocess.run(["zfs", "inherit", prop, ds.name])
+    print(f"[+] {ds.name} is no longer managed by zz. Its data and snapshots were kept.", flush=True)
 
 def zz_snaps(dataset, host=None):
     """zz_auto_ snapshot tags of exactly this dataset, newest first. Raises on failure."""
@@ -538,8 +596,8 @@ def run_status(args):
     return unhealthy
 
 def run_meta(args):
-    ds = ZzDataset(args.dataset)
-    if not ds or not ds.props: return
+    ds = managed_dataset(args.dataset)
+    if not ds: return True
     print(f"\n[ zz Contract: {args.dataset} ]", flush=True)
     print(f"{'DESCRIPTION':<22} | {'KEY':<12} | {'VALUE'}", flush=True)
     print("-" * 65, flush=True)
@@ -566,10 +624,14 @@ def run_set(args):
     ds.set_prop(args.prop, args.value); print(f"[*] Updated {args.prop} to {args.value}", flush=True)
 
 def run_abort(args):
-    ds = ZzDataset(args.dataset)
-    if not ds or ds.target == "-": return
-    remote_host, remote_path = parse_target(ds.target)
-    subprocess.run(["ssh", remote_host, f"zfs recv -A {remote_path}"])
+    ds = managed_dataset(args.dataset)
+    if not ds: return True
+    try: remote_host, remote_path = parse_target(ds.target)
+    except ValueError as e: print(f"[!] {e}", flush=True); return True
+    if get_token(remote_host, remote_path) == "-":
+        print(f"[*] No interrupted transfer on {remote_host}:{remote_path}; nothing to abort.", flush=True); return
+    if subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs recv -A {remote_path}"]).returncode != 0:
+        print("[!] Could not clear the resume token.", flush=True); return True
     print("[+] Resume token cleared.", flush=True)
 
 def main():

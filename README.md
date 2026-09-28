@@ -49,6 +49,14 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```bash
 * * * * * /usr/local/bin/zz sync >> /var/log/zz.log 2>&1
 ```
+Each run logs a header with the version and time, then one line per snapshot sent:
+```
+--- zz 0.3.2 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
+[*] tank/data: Taking scheduled snapshot @zz_auto_1790630101...
+    [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
+    [*] Pruning local...
+    [*] Pruning remote (backup-server)...
+```
 
 ### 3. Check Status
 View replication health for all managed datasets:
@@ -150,7 +158,7 @@ Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`
 divergence. If it is modified, syncs fail with "destination has been modified" and
 `zz status` shows `ERROR`; roll the remote back to its newest `zz_auto_` snapshot
 (`zfs rollback pool/data@zz_auto_...`) and the next sync catches up.
-* **Lock Files:** Stored in /tmp/zz_[dataset_name].lock to prevent overlapping runs.
+* **Lock Files:** Stored in `/run/zz/` (root-only; override with `ZZ_LOCK_DIR`). A short lock serializes snapshotting, and a second lock prevents overlapping transfers, so snapshots are still taken on schedule while a long transfer runs.
 * **Schedule Drift:** A snapshot is taken when at least `freq` minus 30 seconds has
 passed since the last one. Without that allowance, a cron run a second early would
 defer the snapshot to the next run, and the schedule would creep later over time.
