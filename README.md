@@ -98,6 +98,13 @@ Examples:
   zz restore backup:pool/data tank/data --latest
 ```
 
+## 🏷️ Versioning
+`zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
+```
+zz 0.1.0 (2b6ae23)
+```
+The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
+
 ## ⚙️ Configuration (The Contract)
 zz stores configuration in ZFS user properties. The settings move with the dataset.
 

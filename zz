@@ -7,8 +7,24 @@ import datetime
 import os
 import fcntl
 import re
+import functools
+
+__version__ = "0.1.0"
 
 # --- Helpers ---
+
+@functools.lru_cache()
+def get_version():
+    """Version string, plus the git commit (and -dirty if modified) when run from a checkout."""
+    src = os.path.realpath(__file__)
+    here = os.path.dirname(src)
+    try:
+        rev = subprocess.check_output(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                                      encoding='utf-8', stderr=subprocess.DEVNULL).strip()
+        dirty = subprocess.run(["git", "-C", here, "diff", "--quiet", "HEAD", "--", src],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0
+        return f"{__version__} ({rev}{'-dirty' if dirty else ''})"
+    except: return __version__
 
 def parse_duration(val):
     if not val or val == "-": return 0
@@ -182,6 +198,7 @@ def run_init(args):
     else: print("[!] Transfer interrupted. Run again to resume.", flush=True)
 
 def run_sync(args):
+    print(f"--- zz {get_version()} sync @ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---", flush=True)
     names = [args.dataset] if args.dataset else get_managed_datasets()
     for name in names:
         ds = ZzDataset(name)
@@ -327,6 +344,7 @@ def run_restore(args):
         print(f"[+] Done.", flush=True)
 
 def run_status(args):
+    print(f"zz {get_version()}\n", flush=True)
     managed = get_managed_datasets()
     if not managed: print("No managed datasets.", flush=True); return
     print(f"{'DATASET':<20} | {'STATUS':<10} | {'LAST SYNC':<18} | {'NEXT SYNC'}", flush=True)
@@ -371,6 +389,7 @@ def run_abort(args):
 
 def main():
     parser = argparse.ArgumentParser(prog='zz', description='Zeasy: Simplified ZFS Replication', formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--version', action='version', version=f"zz {get_version()}")
     subparsers = parser.add_subparsers(title='Commands', dest='command', metavar='<command>')
     pi = subparsers.add_parser('init', help='Setup replication'); pi.add_argument('dataset'); pi.add_argument('remote')
     pi.add_argument('--freq', default='60m'); pi.add_argument('--keep-local', default='7d'); pi.add_argument('--keep-remote', default='30d'); pi.add_argument('--keep-min', default='10'); pi.set_defaults(func=run_init)
