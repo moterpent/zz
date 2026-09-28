@@ -47,7 +47,7 @@ zz init tank/data backup-server:pool/data --freq 5m --keep-local 1h --keep-remot
 ### 2. Automate with Cron
 Add zz sync to your crontab. It handles its own locking and timing checks.
 ```bash
-* * * * * /usr/local/bin/zz sync >> /var/log/zz.log 2>&1
+* * * * * /usr/local/bin/zz sync >> /var/log/zz.out 2>&1
 ```
 Each run logs a header with the version and time, then one line per snapshot sent:
 ```
@@ -56,6 +56,11 @@ Each run logs a header with the version and time, then one line per snapshot sen
     [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
     [*] Pruning local...
     [*] Pruning remote (backup-server)...
+```
+
+Rotate the log with the included logrotate rule (weekly, 12 compressed weeks kept):
+```bash
+cp util/zz.logrotate /etc/logrotate.d/zz   # edit the path to match your cron line
 ```
 
 ### 3. Check Status

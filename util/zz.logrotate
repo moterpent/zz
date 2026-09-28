@@ -1,0 +1,13 @@
+# logrotate rule for the zz sync log. Install with:
+#   cp util/zz.logrotate /etc/logrotate.d/zz
+# Adjust the path if your cron line logs somewhere else. No copytruncate is
+# needed: cron reopens the log with >> on every run.
+/var/log/zz.out {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}
