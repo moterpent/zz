@@ -11,7 +11,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -82,6 +82,12 @@ def human_bytes(n):
     for unit in ("B", "K", "M", "G", "T"):
         if n < 1024 or unit == "T": return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
         n /= 1024
+
+def fmt_gap(seconds):
+    """Compact interval: '1:00', '0:05', '2d 3:15'."""
+    m = (max(0, int(seconds)) + 30) // 60  # nearest minute; the 30s schedule allowance otherwise shows 0:59
+    d, m = divmod(m, 1440)
+    return (f"{d}d " if d else "") + f"{m // 60}:{m % 60:02d}"
 
 def fmt_age(seconds):
     return str(datetime.timedelta(seconds=max(0, int(seconds))))
@@ -598,6 +604,79 @@ def run_status(args):
     if errors: print("\nLast errors:\n" + "\n".join(errors), flush=True)
     return unhealthy
 
+def snap_table(dataset, host=None):
+    """{tag: (creation, used, written)} for zz_auto_ snapshots of exactly this dataset, plus
+    the dataset's usedbysnapshots. Raises CalledProcessError on failure."""
+    cmd = ["zfs", "list", "-t", "snapshot", "-H", "-p", "-o", "name,creation,used,written", dataset]
+    ubs = ["zfs", "get", "-H", "-p", "-o", "value", "usedbysnapshots", dataset]
+    if host:
+        cmd = ["ssh", "-o", "BatchMode=yes", host] + cmd
+        ubs = ["ssh", "-o", "BatchMode=yes", host] + ubs
+    rows = {}
+    for line in subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL).splitlines():
+        name, creation, used, written = line.split('\t')
+        if "@zz_auto_" in name:
+            rows[name.split('@', 1)[1]] = (int(creation), int(used), int(written) if written.isdigit() else None)
+    held = subprocess.check_output(ubs, encoding='utf-8', stderr=subprocess.DEVNULL).strip()
+    return rows, int(held) if held.isdigit() else None
+
+def run_snaps(args):
+    name = args.dataset
+    if not name:
+        managed = get_managed_datasets()
+        if managed is None: return True
+        if len(managed) != 1:
+            print("[!] Specify a dataset: " + (", ".join(managed) if managed else "no managed datasets"), flush=True)
+            return True
+        name = managed[0]
+    ds = managed_dataset(name)
+    if not ds: return True
+    try: remote_host, remote_path = parse_target(ds.target)
+    except ValueError as e: print(f"[!] {e}", flush=True); return True
+
+    print(f"zz {get_version()}   {name} -> {ds.target}\n", flush=True)
+    try: local, local_held = snap_table(name)
+    except subprocess.CalledProcessError:
+        print(f"[!] Could not list local snapshots of {name}.", flush=True); return True
+    try: remote, remote_held = snap_table(remote_path, remote_host); remote_ok = True
+    except subprocess.CalledProcessError:
+        remote, remote_held, remote_ok = {}, None, False
+
+    both = [t for t in local if t in remote]
+    bridge = max(both, key=lambda t: local[t][0]) if both else None
+    tags = sorted(set(local) | set(remote), key=lambda t: (local.get(t) or remote[t])[0], reverse=True)
+    shown = tags if args.all else tags[:args.limit]
+
+    print(f"{'SNAPSHOT (local time)':<21} | {'GAP':>8} | {'WRITTEN':>8} | {'LOCAL USED':>10} | {'REMOTE USED':>11} | STATE", flush=True)
+    print("-" * 90, flush=True)
+    for i, t in enumerate(shown):
+        creation, _, written = local.get(t) or remote[t]
+        older = tags[i + 1] if i + 1 < len(tags) else None
+        gap = fmt_gap(creation - (local.get(older) or remote[older])[0]) if older else "-"
+        if not remote_ok: state = "?"
+        elif t in local and t in remote: state = "both"
+        elif t in local: state = "pending" if bridge is None or creation > local[bridge][0] else "local only"
+        else: state = "remote only"
+        if t == bridge: state += "  <- bridge"
+        when = datetime.datetime.fromtimestamp(creation).strftime('%Y-%m-%d %H:%M')
+        lu = human_bytes(local[t][1]) if t in local else "-"
+        ru = human_bytes(remote[t][1]) if t in remote else ("?" if not remote_ok else "-")
+        wr = human_bytes(written) if written is not None else "-"
+        print(f"{when:<21} | {gap:>8} | {wr:>8} | {lu:>10} | {ru:>11} | {state}", flush=True)
+    if len(shown) < len(tags):
+        print(f"... {len(tags) - len(shown)} older snapshot(s) not shown (--all to show everything)", flush=True)
+
+    def summary(label, rows, held):
+        if not rows: return f"{label:<7} no zz snapshots"
+        oldest = datetime.datetime.fromtimestamp(min(r[0] for r in rows.values())).strftime('%Y-%m-%d %H:%M')
+        held_str = f"{human_bytes(held)} held by snapshots" if held is not None else "snapshot space unknown"
+        return f"{label:<7} {len(rows)} snapshots, {held_str}, oldest {oldest}"
+    print("\n" + summary("LOCAL", local, local_held), flush=True)
+    if remote_ok: print(summary("REMOTE", remote, remote_held), flush=True)
+    else:
+        print(f"REMOTE  [!] could not list snapshots on {remote_host}:{remote_path}; showing local side only", flush=True)
+        return True
+
 def run_meta(args):
     ds = managed_dataset(args.dataset)
     if not ds: return True
@@ -656,6 +735,14 @@ def main():
                          "locks, busy checks and errors still apply; the remote is never overwritten.")
     ps.set_defaults(func=run_sync)
     subparsers.add_parser('status', help='Replication health of all managed datasets').set_defaults(func=run_status)
+    pn = subparsers.add_parser('snaps', help='Snapshots on both sides with sizes: [dataset] [--limit N] [--all]',
+                               description='List zz snapshots on the local and remote side, newest first. WRITTEN is the data '
+                                           'changed in that interval (about the size of its send); USED is the space deleting '
+                                           'that one snapshot would free.')
+    pn.add_argument('dataset', nargs='?', help='managed dataset (optional if only one is managed)')
+    pn.add_argument('--limit', type=int, default=24, help='newest N snapshots to show (default 24)')
+    pn.add_argument('--all', action='store_true', help='show every snapshot')
+    pn.set_defaults(func=run_snaps)
     pm = subparsers.add_parser('meta', help='Show a dataset\'s settings: <dataset>'); pm.add_argument('dataset'); pm.set_defaults(func=run_meta)
     pset = subparsers.add_parser('set', help='Change a setting: <dataset> <prop> <value>'); pset.add_argument('dataset'); pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min']); pset.add_argument('value'); pset.set_defaults(func=run_set)
     pa = subparsers.add_parser('abort', help='Discard an interrupted transfer on the remote: <dataset>'); pa.add_argument('dataset'); pa.set_defaults(func=run_abort)
