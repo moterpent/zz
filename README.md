@@ -3,7 +3,7 @@
 
 **zz** is a lightweight Python utility designed to make ZFS off-site replication "Zeasy." It handles the heavy lifting of incremental sends, retention policies, and disaster recovery, ensuring your data is always backed up without the complexity of enterprise-grade storage orchestrators.
 
-This project was started after years of frustration with other zfs replication tools.  There are far more mature, feature rich, and scalable solutions out there.  However, due to issues with setup, maintenance, breakage, recovery from breakage, and disaster recovery, and my own limitations, enough was enough.  It started with two main tenants.  Be simple and reliable.  A person with minimal zfs knowledge (ability to create/modify/destroy pools and datasets) should be able to do any of the following in under a minute:
+This project was started after years of frustration with other zfs replication tools.  There are far more mature, feature rich, and scalable solutions out there.  However, due to issues with setup, maintenance, breakage, recovery from breakage, and disaster recovery, and my own limitations, enough was enough.  It started with two main tenets.  Be simple and reliable.  A person with minimal zfs knowledge (ability to create/modify/destroy pools and datasets) should be able to do any of the following in under a minute:
 1. Initialize and start replication with a replica server.
 2. Determine the status of the replication.
 3. Restore the primary from a replica and, once complete, resume replication with little or no fuss.
@@ -14,7 +14,7 @@ This project was started after years of frustration with other zfs replication t
 
 * **Atomic Locking:** Internal file locking prevents overlapping cron jobs from colliding.
 * **Sequential Catch-Up:** Automatically detects and sends missing snapshot history if the network or server was down.
-* **Phase-Drift Correction:** Built-in "slop" and timestamp flooring ensures syncs stay aligned with clock and minute boundaries.
+* **Drift-Free Scheduling:** A 30-second allowance lets a snapshot fire on the cron run it is due, so the schedule doesn't creep later over time.
 * **Dual Retention & Pruning:** Maintain independent history windows (e.g., keep 1 hour of history locally but 30 days remotely).
 * **One-Command Recovery:** Rebuild a lost local dataset from your remote target with a single `restore` command.
 * **Zero-Database:** All configuration is stored directly in ZFS user properties on the dataset itself.
@@ -23,13 +23,16 @@ This project was started after years of frustration with other zfs replication t
 
 ## 🛠️ Installation
 
-1.  Ensure **Python 3.6+** is installed on your host (Tested on Rocky Linux 9).
-2.  Download the `zz` script to `/usr/local/bin/`.
-3.  Make it executable:
+1.  Ensure **Python 3.7+** is installed on your host (Tested on Rocky Linux 9).
+2.  Clone the repository and link the script onto your path (this lets `zz --version` report the exact commit):
     ```bash
-    chmod +x /usr/local/bin/zz
+    git clone https://github.com/moterpent/zz /usr/local/src/zz
+    ln -s /usr/local/src/zz/zz /usr/local/bin/zz
     ```
-4.  Ensure **SSH Key-Based Authentication** is configured between the local and remote host.
+    Or copy the `zz` script to `/usr/local/bin/` and `chmod +x` it.
+3.  Ensure **SSH Key-Based Authentication** is configured from the local host to the remote host.
+
+To update a cloned install: `git -C /usr/local/src/zz pull`.
 
 ---
 
@@ -89,37 +92,44 @@ zz meta tank/data
 
 ## Command Line Usage
 ```
-usage: zz [-h] <command> ...
+usage: zz [-h] [--version] <command> ...
 
 Zeasy: Simplified ZFS Replication
 
 options:
   -h, --help  show this help message and exit
+  --version   show program's version number and exit
 
 Commands:
   <command>
-    init      Setup replication [dataset] [remote] [--freq] [--keep-local] [--keep-remote] [--keep-min]
-    sync      Run incremental sync [dataset] [--force]
-    status    Show health of all managed datasets
-    meta      View configuration contract [dataset]
-    set       Update properties [dataset] [prop] [value]
-    forget    Stop tracking a dataset [dataset]
-    restore   Recover from remote [remote] [local_dataset] [--latest]
+    init      Start replicating a dataset: <dataset> <host:pool/dataset> [--freq] [--keep-local] [--keep-remote] [--keep-min]
+    sync      Snapshot if due and send to the remote: [dataset] [--force]
+    status    Replication health of all managed datasets
+    meta      Show a dataset's settings: <dataset>
+    set       Change a setting: <dataset> <prop> <value>
+    abort     Discard an interrupted transfer on the remote: <dataset>
+    forget    Stop managing a dataset (data is kept): <dataset>
+    restore   Recreate a dataset from the remote: <host:pool/dataset> <dataset> [--latest]
+
+Durations: 30m, 1h, 7d, 2w, 1y (a bare number means minutes).
 
 Examples:
   zz init tank/data backup:pool/data --freq 1h
-  zz restore backup:pool/data tank/data --latest
+  zz status
+  zz restore backup:pool/data tank/data
 ```
 
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.3.0 (893f011)
+zz 0.3.1 (1334ac9)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
 ## ⚙️ Configuration (The Contract)
-zz stores configuration in ZFS user properties. The settings move with the dataset.
+zz stores configuration in ZFS user properties. The settings move with the dataset. `init` and `set` reject invalid values; if one is set some other way, zz skips the affected step and reports it as an `ERROR` rather than guessing.
+
+Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`); a bare number means minutes.
 
 |Property     |Description|Default|Example|
 |-------------|---------------|-------------------|-------------|
@@ -137,10 +147,13 @@ zz stores configuration in ZFS user properties. The settings move with the datas
 * **Snapshots:** zz only manages snapshots prefixed with @zz_auto_.
 * **Remote Integrity:** zz uses incremental sends without the -F (Force) flag. Do
   not modify the remote dataset directly (keep it readonly=on) to avoid stream
-divergence.
+divergence. If it is modified, syncs fail with "destination has been modified" and
+`zz status` shows `ERROR`; roll the remote back to its newest `zz_auto_` snapshot
+(`zfs rollback pool/data@zz_auto_...`) and the next sync catches up.
 * **Lock Files:** Stored in /tmp/zz_[dataset_name].lock to prevent overlapping runs.
-* **Phase-Drift:** The script "floors" the last sync time to the
-nearest minute to prevent the schedule from slowly drifting forward.📄
+* **Schedule Drift:** A snapshot is taken when at least `freq` minus 30 seconds has
+passed since the last one. Without that allowance, a cron run a second early would
+defer the snapshot to the next run, and the schedule would creep later over time.
 
 License: 
 MIT License
