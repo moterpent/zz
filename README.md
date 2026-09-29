@@ -236,6 +236,9 @@ hand on the backup host: `zfs set readonly=on canmount=noauto pool/data`. If it 
 passed since the last one. Without that allowance, a cron run a second early would
 defer the snapshot to the next run, and the schedule would creep later over time.
 
+## 📜 Changelog
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version, including notes for upgrading.
+
 ## 📄 License
 [MIT](LICENSE) © 2026 Moter Pent. Provided "as is", without warranty of any kind.
 
