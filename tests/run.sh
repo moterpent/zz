@@ -67,6 +67,10 @@ held()   { zfs list -H -t snapshot -o name -d 1 "$1" | xargs -r zfs holds -H 2>/
 # Release zz's holds, as an admin deliberately deleting something would have to
 unhold() { held "$1" | xargs -r -n1 zfs release -r zz_bridge; }
 wipe()   { unhold "$1"; zfs destroy -r "$1"; }
+# zz-managed datasets on this host that aren't ours: status and no-argument commands
+# consider every managed dataset, so host-wide assertions only hold when there are none
+others() { zfs get -H -t filesystem -s local -o name zz:target 2>/dev/null | grep -v "^$SRC/"; }
+alone()  { [ -z "$(others)" ]; }
 nsnaps() { zfs list -H -t snapshot -o name -d 1 "$1" 2>/dev/null | grep -c '@zz_auto_'; }
 newest() { zfs list -H -t snapshot -o name -S creation -d 1 "$1" | grep '@zz_auto_' | head -1 | cut -d@ -f2; }
 prop()   { zfs get -H -s local -o value "zz:$1" "$DS"; }
@@ -117,11 +121,25 @@ if [ $SKIP = 0 ]; then
     check "no zfs -v progress lines"      out_lacks "estimated size"
     check "replica caught up"             [ "$(newest "$RP")" = "$(newest "$DS")" ]
     run status
-    check "status OK, exit 0"             rc_is 0
-    check "…shows OK"                     out_has "| OK "
-    run snaps
-    check "snaps works without dataset arg" rc_is 0
+    alone && check "status OK, exit 0"    rc_is 0
+    check "…our dataset shows OK"         bash -c "grep -F '$DS ' <<<\"\$0\" | grep -qF '| OK '" "$OUT"
+    if alone; then
+        run snaps
+        check "snaps works without dataset arg" rc_is 0
+    else
+        run snaps
+        check "snaps asks which dataset when several are managed" out_has "$DS"
+        echo "       (other zz datasets on this host: $(others | tr '\n' ' '))"
+        run snaps "$DS"
+    fi
     check "…marks the bridge"             out_has "<- bridge"
+    # Reader gone before zz writes anything (like '| head' on long output)
+    zz snaps "$DS" 2>"$WORK/err" | true
+    check "snaps into a closed pipe: no traceback" bash -c "! grep -q Traceback '$WORK/err'"
+    write f4 2M; tick
+    zz sync "$DS" --now 2>"$WORK/err" | true
+    check "sync into a closed pipe: no traceback" bash -c "! grep -q Traceback '$WORK/err'"
+    check "…and still finished its work"  [ "$(newest "$RP")" = "$(newest "$DS")" ]
 fi
 
 T bridge_hold
@@ -186,7 +204,8 @@ if [ $SKIP = 0 ]; then
     check "recovers after rollback"         rc_is 0
     check "…sends every pending snapshot"   [ "$(newest "$RP")" = "$(newest "$DS")" ]
     run status
-    check "…status back to OK"              rc_is 0
+    alone && check "…status back to OK, exit 0" rc_is 0
+    check "…our dataset back to OK"         bash -c "grep -F '$DS ' <<<\"\$0\" | grep -qF '| OK '" "$OUT"
 fi
 
 T missing_bridge
@@ -259,7 +278,7 @@ if [ $SKIP = 0 ]; then
     check "…releases remote holds"          [ -z "$(held "$RP")" ]
     check "…data kept"                      [ "$(nsnaps "$DS")" -gt 0 ]
     run status
-    check "…no longer listed"               out_has "No managed datasets"
+    check "…no longer listed"               out_lacks "$DS "
 fi
 
 echo

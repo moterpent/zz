@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -779,7 +779,27 @@ def run_abort(args):
         print("[!] Could not clear the resume token.", flush=True); return True
     print("[+] Resume token cleared.", flush=True)
 
+class QuietPipe:
+    """stdout wrapper: if the reader goes away (zz snaps | head), discard further output instead
+    of raising BrokenPipeError. Work in progress (a sync, a restore) carries on to completion."""
+    def __init__(self, stream): self.stream, self.closed_pipe = stream, False
+    def _discard(self):
+        self.closed_pipe = True
+        try: os.dup2(os.open(os.devnull, os.O_WRONLY), self.stream.fileno())
+        except OSError: pass
+    def write(self, text):
+        if not self.closed_pipe:
+            try: return self.stream.write(text)
+            except BrokenPipeError: self._discard()
+        return len(text)
+    def flush(self):
+        if not self.closed_pipe:
+            try: self.stream.flush()
+            except BrokenPipeError: self._discard()
+    def __getattr__(self, name): return getattr(self.stream, name)
+
 def main():
+    sys.stdout = QuietPipe(sys.stdout)
     parser = argparse.ArgumentParser(prog='zz', description='Zeasy: Simplified ZFS Replication', formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Durations: 30m, 1h, 7d, 2w, 1y (a bare number means minutes).\n\n"
                "Examples:\n  zz init tank/data backup:pool/data --freq 1h\n  zz status\n  zz restore backup:pool/data tank/data")
