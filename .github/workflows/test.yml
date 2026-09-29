@@ -34,4 +34,4 @@ jobs:
             || { sudo apt-get install -y "linux-headers-$(uname -r)" zfs-dkms && sudo modprobe zfs; }
           zfs version
       - name: Integration tests (real ZFS, throwaway pools)
-        run: sudo tests/run.sh
+        run: sudo GITHUB_ACTIONS="$GITHUB_ACTIONS" tests/run.sh   # sudo drops the env; keep annotations working
