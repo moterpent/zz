@@ -1,0 +1,240 @@
+#!/bin/bash
+# Integration tests for zz against real ZFS.
+#
+# Creates two throwaway file-backed pools (unique names, mounted under a temp
+# directory), runs every scenario, and destroys everything it created on exit.
+# Existing pools are never touched.
+#
+# Requirements: root, ZFS kernel module + zfsutils, python3.
+#   sudo tests/run.sh                 # all tests
+#   sudo tests/run.sh restore         # only tests whose name contains "restore"
+#
+# The "remote" is a stand-in ssh that runs commands locally, so no sshd is
+# needed; zz still goes through its normal ssh code paths.
+
+set -u
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+FILTER=${1:-}
+RUNID=$$
+SRC=zztsrc$RUNID
+DST=zztdst$RUNID
+WORK=$(mktemp -d /var/tmp/zztest.XXXXXX)
+MNT=$WORK/mnt
+PASS=0; FAIL=0; FAILED=()
+
+[ "$(id -u)" = 0 ] || { echo "must run as root"; exit 2; }
+command -v zpool >/dev/null || { echo "zpool not found (install ZFS)"; exit 2; }
+
+cleanup() {
+    for p in "$SRC" "$DST"; do zpool list "$p" >/dev/null 2>&1 && zpool destroy -f "$p"; done
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# --- environment ---
+mkdir -p "$WORK/bin" "$MNT"
+cat > "$WORK/bin/ssh" <<'EOF'
+#!/bin/bash
+# Stand-in for ssh: drop options and the host, run the command locally.
+while [[ $# -gt 0 && "$1" == -* ]]; do case "$1" in -o|-p|-i|-l) shift 2 ;; *) shift ;; esac; done
+shift  # host
+exec bash -c "$*"
+EOF
+chmod +x "$WORK/bin/ssh"
+export PATH="$WORK/bin:$PATH" ZZ_LOCK_DIR="$WORK/locks"
+
+truncate -s 1G "$WORK/src.img" "$WORK/dst.img"
+zpool create -R "$MNT" "$SRC" "$WORK/src.img" || exit 2
+zpool create -R "$MNT" "$DST" "$WORK/dst.img" || exit 2
+
+DS=$SRC/data                 # local dataset under test
+RP=$DST/bk/data              # remote path (nested; parent created by init)
+TARGET=zzremote:$RP
+
+# --- helpers ---
+zz() { python3 "$REPO/zz" "$@"; }
+# run: capture output in $OUT and exit code in $RC
+run() { OUT=$(zz "$@" 2>&1); RC=$?; }
+ok()   { PASS=$((PASS+1)); echo "  ok   $*"; }
+bad()  { FAIL=$((FAIL+1)); FAILED+=("$CUR: $*"); echo "  FAIL $*"; }
+check() { local desc=$1; shift; if "$@"; then ok "$desc"; else bad "$desc"; fi; }
+rc_is() { [ "$RC" = "$1" ] || { echo "       expected exit $1, got $RC; output:"; sed 's/^/       | /' <<<"$OUT"; return 1; }; }
+out_has() { grep -qF -- "$1" <<<"$OUT" || { echo "       missing: $1"; sed 's/^/       | /' <<<"$OUT"; return 1; }; }
+out_lacks() { ! grep -qF -- "$1" <<<"$OUT" || { echo "       unexpected: $1"; return 1; }; }
+exists() { zfs list -H -o name "$1" >/dev/null 2>&1; }
+nsnaps() { zfs list -H -t snapshot -o name -d 1 "$1" 2>/dev/null | grep -c '@zz_auto_'; }
+newest() { zfs list -H -t snapshot -o name -S creation -d 1 "$1" | grep '@zz_auto_' | head -1 | cut -d@ -f2; }
+prop()   { zfs get -H -s local -o value "zz:$1" "$DS"; }
+# mountpoint may or may not already include the pool's altroot, depending on ZFS version
+mnt()    { local m; m=$(zfs get -H -o value mountpoint "$1"); [ -d "$m" ] && echo "$m" || echo "$MNT$m"; }
+write()  { head -c "$2" /dev/urandom > "$(mnt "$DS")/$1"; }
+tick()   { sleep 1.1; }   # snapshot names are per-second
+
+T() { CUR=$1; if [ -n "$FILTER" ] && [[ "$CUR" != *"$FILTER"* ]]; then SKIP=1; else SKIP=0; echo "== $CUR"; fi; }
+
+# --- tests (order matters: later tests build on earlier state) ---
+
+T init
+if [ $SKIP = 0 ] || true; then   # always runs: everything depends on it
+    zfs create "$DS"; write f1 40M
+    run init "$DS" "$TARGET" --freq 1h --keep-local 1m --keep-min 1
+    check "init succeeds"                 rc_is 0
+    check "remote parent created"         exists "$DST/bk"
+    check "data landed at exact path"     [ "$(nsnaps "$RP")" = 1 ]
+    check "last_sent recorded"            [ -n "$(prop last_sent)" ]
+    run init "$DS" "$TARGET"
+    check "second init refuses existing remote"   rc_is 1
+    check "…and says so"                  out_has "already exists"
+fi
+
+T validation
+if [ $SKIP = 0 ]; then
+    run init "$DS" zzremote:$DST/x --keep-remote 7days
+    check "init rejects bad duration"     rc_is 2
+    run init "$DS" nocolon
+    check "init rejects bad target"       rc_is 1
+    run set "$DS" keep_remote 1year
+    check "set rejects bad duration"      rc_is 1
+    run set "$DS" keep_min lots
+    check "set rejects bad keep_min"      rc_is 1
+    check "…value unchanged"              [ "$(prop keep_remote)" = 30d ]
+    for c in "abort $SRC/nope" "meta $SRC/nope" "forget $SRC/nope" "sync $SRC/nope" "snaps $SRC/nope"; do
+        run $c; check "'$c' reports missing dataset" rc_is 1
+    done
+fi
+
+T sync_status_snaps
+if [ $SKIP = 0 ]; then
+    write f2 20M; tick
+    run sync "$DS" --now
+    check "sync succeeds"                 rc_is 0
+    check "one-line send summary"         out_has "[+] Sent $DS @"
+    check "no zfs -v progress lines"      out_lacks "estimated size"
+    check "replica caught up"             [ "$(newest "$RP")" = "$(newest "$DS")" ]
+    run status
+    check "status OK, exit 0"             rc_is 0
+    check "…shows OK"                     out_has "| OK "
+    run snaps
+    check "snaps works without dataset arg" rc_is 0
+    check "…marks the bridge"             out_has "<- bridge"
+fi
+
+T now_keeps_schedule
+if [ $SKIP = 0 ]; then
+    anchor=$(prop last_sync); n=$(nsnaps "$DS"); tick
+    run sync "$DS" --now
+    check "--now takes a snapshot"        [ "$(nsnaps "$DS")" = $((n+1)) ]
+    check "…labelled on-demand"           out_has "on-demand"
+    check "…schedule anchor unchanged"    [ "$(prop last_sync)" = "$anchor" ]
+    tick; run sync "$DS" --force
+    check "--force still works"           out_has "on-demand"
+    n=$(nsnaps "$DS"); run sync "$DS"
+    check "plain sync takes nothing when not due" [ "$(nsnaps "$DS")" = "$n" ]
+fi
+
+T concurrent_snapshot
+if [ $SKIP = 0 ]; then
+    zfs set zz:last_sync=$(( $(date +%s) - 7200 )) "$DS"; n=$(nsnaps "$DS")
+    zz sync "$DS" >/dev/null 2>&1 & zz sync "$DS" >/dev/null 2>&1 & wait
+    check "two simultaneous syncs take one snapshot" [ "$(nsnaps "$DS")" = $((n+1)) ]
+    run sync "$DS"
+    check "…and it gets sent"             [ "$(newest "$RP")" = "$(newest "$DS")" ]
+fi
+
+T diverged_replica
+if [ $SKIP = 0 ]; then
+    bridge=$(newest "$RP")
+    zfs mount "$RP" 2>/dev/null; date > "$(mnt "$RP")/diverge"
+    tick; run sync "$DS" --now
+    check "sync fails on modified replica"  rc_is 1
+    check "…with zfs's reason"              out_has "has been modified"
+    echo "       (waiting 65s so pending snapshots pass the 1m local retention)"
+    # Everything from the bridge onward is unsent (or the incremental base) and must survive.
+    # Older, already-sent snapshots may legitimately be pruned.
+    sleep 65
+    keep=$(zfs list -H -t snapshot -o name -s creation -d 1 "$DS" | sed -n "/@$bridge\$/,\$p")
+    run sync "$DS" --now
+    check "pending snapshots and bridge never pruned" bash -c "for s in $(echo $keep); do zfs list -H -o name \$s >/dev/null || exit 1; done"
+    check "…and the new one was added"      [ "$(zfs list -H -t snapshot -o name -s creation -d 1 "$DS" | sed -n "/@$bridge\$/,\$p" | wc -l)" = $(( $(wc -w <<<"$keep") + 1 )) ]
+    run status
+    check "status ERROR, exit 1"            rc_is 1
+    check "…lists the error"                out_has "Transfer failed"
+    zfs rollback "$RP@$bridge"; zfs unmount "$RP" 2>/dev/null
+    run sync "$DS"
+    check "recovers after rollback"         rc_is 0
+    check "…sends every pending snapshot"   [ "$(newest "$RP")" = "$(newest "$DS")" ]
+    run status
+    check "…status back to OK"              rc_is 0
+fi
+
+T missing_bridge
+if [ $SKIP = 0 ]; then
+    zfs destroy "$DS@$(newest "$DS")"; tick
+    run sync "$DS" --now
+    check "missing bridge is an error"      rc_is 1
+    check "…says intervention needed"       out_has "manual intervention required"
+fi
+
+T restore_refuses_overwrite
+if [ $SKIP = 0 ]; then
+    run restore "$TARGET" "$DS"
+    check "restore refuses live dataset"    rc_is 1
+    check "…and says why"                   out_has "not a partial restore"
+fi
+
+T restore_resume_token
+if [ $SKIP = 0 ]; then
+    (cd "$(mnt "$DS")" && sha256sum f1 f2) > "$WORK/sums"
+    zfs destroy -r "$DS"
+    # Cut the stream inside the first (40M+) snapshot: leaves a real resume token
+    zfs send -R "$RP@$(newest "$RP")" | head -c 15M | zfs recv -s -u "$DS" 2>/dev/null
+    check "partial receive left a resume token" [ "$(zfs get -H -o value receive_resume_token "$DS" 2>/dev/null)" != "-" ]
+    run status
+    check "partial dataset not treated as managed" out_lacks "$DS "
+    run restore "$TARGET" "$DS"
+    check "restore resumes and completes"   rc_is 0
+    check "…resumed from the token"         out_has "Resuming interrupted restore"
+    check "…then caught up the rest"        out_has "Catching up"
+    check "all snapshots restored"          [ "$(nsnaps "$DS")" = "$(nsnaps "$RP")" ]
+    check "newest GUIDs match"              [ "$(zfs get -H -o value guid "$DS@$(newest "$DS")")" = "$(zfs get -H -o value guid "$RP@$(newest "$RP")")" ]
+    check "data intact (checksums)"         bash -c "cd '$(mnt "$DS")' && sha256sum -c --quiet '$WORK/sums'"
+    check "mounted"                         [ "$(zfs get -H -o value mounted "$DS")" = yes ]
+    check "managed again"                   [ "$(prop target)" = "$TARGET" ]
+    tick; run sync "$DS" --now
+    check "sync after restore: one incremental" [ "$(grep -c '\[+\] Sent' <<<"$OUT")" = 1 ]
+fi
+
+T restore_partial_between_snapshots
+if [ $SKIP = 0 ]; then
+    zfs destroy -r "$DS"
+    oldest=$(zfs list -H -t snapshot -o name -s creation -d 1 "$RP" | grep '@zz_auto_' | head -1)
+    zfs send "$oldest" | zfs recv -u "$DS"
+    run restore "$TARGET" "$DS"
+    check "restore continues a partial copy" rc_is 0
+    check "…detected as partial"            out_has "Continuing partial restore"
+    check "all snapshots restored"          [ "$(nsnaps "$DS")" = "$(nsnaps "$RP")" ]
+fi
+
+T restore_latest_unmanaged_copy
+if [ $SKIP = 0 ]; then
+    run restore "$TARGET" "$SRC/copy" --latest
+    check "restore --latest to new name"    rc_is 0
+    check "…left unmanaged"                 out_has "left unmanaged"
+    check "…only the latest snapshot"       [ "$(nsnaps "$SRC/copy")" = 1 ]
+    run forget "$SRC/copy"
+    check "forget on unmanaged copy errors" rc_is 1
+fi
+
+T forget
+if [ $SKIP = 0 ]; then
+    run forget "$DS"
+    check "forget succeeds"                 rc_is 0
+    check "…data kept"                      [ "$(nsnaps "$DS")" -gt 0 ]
+    run status
+    check "…no longer listed"               out_has "No managed datasets"
+fi
+
+echo
+echo "$PASS passed, $FAIL failed"
+for f in "${FAILED[@]+"${FAILED[@]}"}"; do echo "  - $f"; done
+[ "$FAIL" = 0 ]

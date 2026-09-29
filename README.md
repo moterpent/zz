@@ -1,6 +1,8 @@
 # zz (Zeasy) 
 ### *Minimalist, Snapshot-Aware ZFS Replication*
 
+[![tests](https://github.com/moterpent/zz/actions/workflows/test.yml/badge.svg)](https://github.com/moterpent/zz/actions/workflows/test.yml)
+
 **zz** is a lightweight Python utility designed to make ZFS off-site replication "Zeasy." It handles the heavy lifting of incremental sends, retention policies, and disaster recovery, ensuring your data is always backed up without the complexity of enterprise-grade storage orchestrators.
 
 This project was started after years of frustration with other zfs replication tools.  There are far more mature, feature rich, and scalable solutions out there.  However, due to issues with setup, maintenance, breakage, recovery from breakage, and disaster recovery, and my own limitations, enough was enough.  It started with two main tenets.  Be simple and reliable.  A person with minimal zfs knowledge (ability to create/modify/destroy pools and datasets) should be able to do any of the following in under a minute:
@@ -169,6 +171,19 @@ Examples:
   zz status
   zz restore backup:pool/data tank/data
 ```
+
+## 🧪 Testing
+Every push runs two suites on GitHub Actions:
+* **Unit tests** (`tests/test_units.py`): parsing and formatting helpers, on Python 3.9 and 3.12. No ZFS or root needed:
+  ```bash
+  python3 tests/test_units.py
+  ```
+* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
+  ```bash
+  sudo tests/run.sh             # everything (about 2 minutes)
+  sudo tests/run.sh restore     # only tests whose name contains "restore"
+  ```
+  The "remote" is simulated on the same machine, so one host is enough.
 
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:

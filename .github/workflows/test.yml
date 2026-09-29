@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]   # 3.9 is Rocky/RHEL 9's system Python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 tests/test_units.py
+
+  zfs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ZFS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zfsutils-linux
+          sudo modprobe zfs || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe zfs; }
+          zfs version
+      - name: Integration tests (real ZFS, throwaway pools)
+        run: sudo tests/run.sh
