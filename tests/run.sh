@@ -208,9 +208,13 @@ fi
 
 T concurrent_snapshot
 if [ $SKIP = 0 ]; then
-    zfs set zz:last_sync=$(( $(date +%s) - 7200 )) "$DS"; n=$(nsnaps "$DS")
+    zfs set zz:last_sync=$(( $(date +%s) - 7200 )) "$DS"
+    before=$(zfs list -H -t snapshot -o name -d 1 "$DS" | sort)
     zz sync "$DS" >/dev/null 2>&1 & zz sync "$DS" >/dev/null 2>&1 & wait
-    check "two simultaneous syncs take one snapshot" [ "$(nsnaps "$DS")" = $((n+1)) ]
+    # Compare names, not totals: with the 1m test retention, these syncs may also prune old
+    # snapshots (on a slow machine, earlier ones are over a minute old by now)
+    new=$(comm -13 <(echo "$before") <(zfs list -H -t snapshot -o name -d 1 "$DS" | sort) | grep -c .)
+    check "two simultaneous syncs take one snapshot" [ "$new" = 1 ]
     run sync "$DS"
     check "…and it gets sent"             [ "$(newest "$RP")" = "$(newest "$DS")" ]
 fi
@@ -218,7 +222,9 @@ fi
 T diverged_replica
 if [ $SKIP = 0 ]; then
     bridge=$(newest "$RP")
-    check "read-only replica refuses writes" bash -c "zfs mount '$RP' 2>/dev/null; ! date > '$(mnt "$RP")/diverge' 2>/dev/null"
+    zfs mount "$RP" 2>/dev/null
+    check "read-only replica is mounted for this test" [ "$(val mounted "$RP")" = yes ]
+    check "read-only replica refuses writes" bash -c "! date 2>/dev/null > '$(mnt "$RP")/diverge'" 2>/dev/null
     zfs set readonly=off "$RP"; date > "$(mnt "$RP")/diverge"
     tick; run sync "$DS" --now
     check "sync fails on modified replica"  rc_is 1
@@ -265,7 +271,7 @@ if [ $SKIP = 0 ]; then
     (cd "$(mnt "$DS")" && sha256sum f1 f2) > "$WORK/sums"
     wipe "$DS"
     # Cut the stream inside the first (40M+) snapshot: leaves a real resume token
-    zfs send -R -L -c "$RP@$(newest "$RP")" | head -c 15M | zfs recv -s -u "$DS" 2>/dev/null
+    zfs send -R -L -c "$RP@$(newest "$RP")" 2>/dev/null | head -c 15M | zfs recv -s -u "$DS" 2>/dev/null
     check "partial receive left a resume token" [ "$(zfs get -H -o value receive_resume_token "$DS" 2>/dev/null)" != "-" ]
     run status
     check "partial dataset not treated as managed" out_lacks "$DS "
@@ -309,7 +315,7 @@ T send_flags_compressed
 if [ $SKIP = 0 ]; then
     C=$SRC/comp; zfs create -o compression=lz4 "$C"
     run init "$C" zzremote:$DST/bk/comp --freq 1h
-    yes 'zz compressible test line ' | head -c 30M > "$(mnt "$C")/text"; tick
+    yes 'zz compressible test line ' 2>/dev/null | head -c 30M > "$(mnt "$C")/text"; tick
     run sync "$C" --now
     check "compressed sync succeeds"        rc_is 0
     check "30M of compressible data sends under 5M with -c" [ "$(sent_bytes)" -lt 5242880 ]
@@ -322,13 +328,13 @@ if [ $SKIP = 0 ]; then
     zfs inherit zz:send_flags "$G"   # exactly as a replication set up before 0.5 looks
     run meta "$G"
     check "meta explains missing send flags" out_has "none (set up before zz 0.5)"
-    yes 'zz compressible test line ' | head -c 30M > "$(mnt "$G")/text"; tick
+    yes 'zz compressible test line ' 2>/dev/null | head -c 30M > "$(mnt "$G")/text"; tick
     run sync "$G" --now
     check "flagless (pre-0.5) replication still syncs" rc_is 0
     check "…sending uncompressed (over 25M)" [ "$(sent_bytes)" -gt 26214400 ]
     run set "$G" send_flags "-L -c"
     check "set send_flags accepted"         rc_is 0
-    yes 'more compressible text ' | head -c 30M > "$(mnt "$G")/text2"; tick
+    yes 'more compressible text ' 2>/dev/null | head -c 30M > "$(mnt "$G")/text2"; tick
     run sync "$G" --now
     echo "       (switching an existing replication to -L -c: exit $RC, sent $(sent_bytes) bytes)"
     check "switching to -L -c works on an existing replication" rc_is 0
