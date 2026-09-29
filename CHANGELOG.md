@@ -2,6 +2,12 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.7.0] - 2026-09-28
+
+### Added
+- **Point-in-time restore:** `zz restore ... --at <snapshot|time>` restores as of an earlier snapshot, for when damage (ransomware, a bad deploy, an accidental delete) has already replicated. A time such as `'2026-09-28 01:00'` means the newest snapshot at or before it.
+- By default the result is left unmanaged and the replica is untouched; zz prints the two ways to continue. `--rollback-remote` rolls the replica back to the restore point, permanently deleting its newer snapshots, and resumes replication. Re-running the same restore with the flag picks up where it left off without re-sending.
+
 ## [0.6.0] - 2026-09-28
 
 First tagged release. Everything below 0.6.0 was developed on `main` without tags; it is summarized here so upgraders know what changed.
@@ -45,4 +51,5 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.7.0]: https://github.com/moterpent/zz/releases/tag/v0.7.0
 [0.6.0]: https://github.com/moterpent/zz/releases/tag/v0.6.0

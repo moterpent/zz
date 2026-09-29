@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -660,6 +660,33 @@ def snap_guid(snapshot, host=None):
     try: return subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL).strip()
     except subprocess.CalledProcessError: return None
 
+def resolve_restore_point(at, remote_ds, host):
+    """Snapshot tag for --at: a zz_auto_ name (with or without @), an epoch, or a local time such
+    as '2026-09-28 01:00'; a time means the newest snapshot at or before it."""
+    try:
+        res = subprocess.check_output(zfs_on(host, "list", "-H", "-p", "-t", "snapshot", "-o", "name,creation", "-d", "1", remote_ds),
+                                      encoding='utf-8', stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print(f"[!] Could not list snapshots of {remote_ds} on {host}.", flush=True); return None
+    snaps = sorted(((int(c), n.split('@', 1)[1]) for n, c in (l.split('\t') for l in res.splitlines() if l)
+                    if "@zz_auto_" in n), reverse=True)
+    tag = at.lstrip('@')
+    if tag.startswith("zz_auto_"):
+        if tag in {t for _, t in snaps}: return tag
+        print(f"[!] No snapshot @{tag} on {host}:{remote_ds}. See: zz snaps", flush=True); return None
+    when = None
+    if at.isdigit(): when = int(at)
+    else:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try: when = int(datetime.datetime.strptime(at, fmt).timestamp()); break
+            except ValueError: pass
+    if when is None:
+        print(f"[!] --at '{at}': use a snapshot name (zz_auto_...) or a time like '2026-09-28 01:00'.", flush=True); return None
+    for created, t in snaps:
+        if created <= when: return t
+    print(f"[!] No snapshot at or before {at} on {host}:{remote_ds}; the oldest is @{snaps[-1][1] if snaps else '-'}.", flush=True)
+    return None
+
 def run_restore(args):
     try: remote_host, remote_ds = parse_target(args.remote)
     except ValueError as e: print(f"[!] {e}", flush=True); return True
@@ -673,6 +700,13 @@ def run_restore(args):
     if not remote_snaps:
         print(f"[!] No zz_auto_ snapshots found on {remote_host}:{remote_ds}.", flush=True); return True
     latest = remote_snaps[0]
+    if args.at:
+        latest = resolve_restore_point(args.at, remote_ds, remote_host)
+        if not latest: return True
+    newer = remote_snaps[:remote_snaps.index(latest)]   # replica snapshots after the restore point
+    if newer:
+        print(f"[*] Restore point: @{latest} ({datetime.datetime.fromtimestamp(snap_time(latest)).strftime('%Y-%m-%d %H:%M:%S')}); "
+              f"{len(newer)} newer snapshot(s) on the replica will not be restored", flush=True)
     try:
         res = subprocess.check_output(["ssh", "-o", "BatchMode=yes", remote_host,
                                        f"zfs get all -H -o property,value {remote_ds}"], encoding='utf-8')
@@ -705,7 +739,8 @@ def run_restore(args):
         stale = [k for k in missing if not any(k.startswith(m + "/") for m in missing)]  # -X covers descendants
         expected = [k for k in kids if k not in missing]
         if stale:
-            print(f"    [!] Not restoring {len(stale)} child dataset(s) that no longer exist on the primary "
+            why = "didn't exist at that point" if args.at else "no longer exist on the primary"
+            print(f"    [!] Not restoring {len(stale)} child dataset(s) that {why} "
                   f"(no @{latest}): {', '.join(stale)}\n"
                   f"        They remain on {remote_host} until they age out of retention. To recover files from one,\n"
                   f"        on {remote_host}: zfs mount <dataset>   (it's read-only; see also its .zfs/snapshot directory)", flush=True)
@@ -786,7 +821,24 @@ def run_restore(args):
     for n, canmount in (l.split('\t') for l in res.splitlines() if l):
         if n == local_ds or canmount == "noauto": subprocess.run(["zfs", "set", "canmount=on", n])
     owners = [n for n in (get_managed_datasets() or []) if n != local_ds and ZzDataset(n).target == args.remote]
-    if not owners:
+    rolled_back = False
+    if newer and args.rollback_remote and not owners:
+        # Roll the replica back to the restore point so replication can continue from it. This
+        # deletes the newer snapshots on the replica, so it only happens when explicitly asked.
+        print(f"[*] Rolling {remote_host}:{remote_ds} back to @{latest}, deleting {len(newer)} newer snapshot(s)...", flush=True)
+        err = pin_bridge(remote_ds, None, remote_host)   # zz's hold on the old bridge would block it
+        if err: print(f"[!] {err}", flush=True); return True
+        try:
+            tree = subprocess.check_output(zfs_on(remote_host, "list", "-H", "-t", "snapshot", "-o", "name", "-r", remote_ds),
+                                           encoding='utf-8').split()
+        except subprocess.CalledProcessError:
+            print(f"[!] Could not list snapshots on {remote_host}.", flush=True); return True
+        for n in [x.split('@')[0] for x in tree if x.endswith(f"@{latest}")]:
+            rb = subprocess.run(zfs_on(remote_host, "rollback", "-r", f"{n}@{latest}"), capture_output=True, text=True)
+            if rb.returncode != 0:
+                print(f"[!] Could not roll back {n}: {rb.stderr.strip()}", flush=True); return True
+        rolled_back = True
+    if not owners and (not newer or rolled_back):
         ds = ZzDataset(local_ds)
         for pk, pv in remote_props.items(): ds.set_prop(pk.split(':', 1)[1], pv)
         ds.set_prop("target", args.remote); ds.set_prop("last_sync", int(time.time())); ds.record_sent(latest)
@@ -809,6 +861,13 @@ def run_restore(args):
     if owners:
         print(f"[+] Restore complete at @{latest}. {owners[0]} already replicates to {args.remote}, "
               f"so {local_ds} was left unmanaged (use 'zz init' to replicate it elsewhere).", flush=True)
+    elif newer and not rolled_back:
+        print(f"[+] Restore complete at @{latest}. {local_ds} is not replicating yet, because the replica has "
+              f"{len(newer)} newer snapshot(s)\n    (the ones after this point). Choose how to continue:\n"
+              f"      * Keep the replica's history and replicate to a new target (a full send):\n"
+              f"          zz init {local_ds} {remote_host}:{remote_ds}-restored\n"
+              f"      * Roll the replica back to this point, permanently deleting those newer snapshots there:\n"
+              f"          zz restore {args.remote} {local_ds} --at {latest} --rollback-remote", flush=True)
     else:
         print(f"[+] Restore complete at @{latest}. Replication to {args.remote} will resume on the next sync.", flush=True)
 
@@ -1048,7 +1107,15 @@ def main():
     pset = subparsers.add_parser('set', help='Change a setting: <dataset> <prop> <value>'); pset.add_argument('dataset'); pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min', 'send_flags']); pset.add_argument('value', nargs=argparse.REMAINDER, help="new value (e.g. 7d, or send flags such as -L -c)"); pset.set_defaults(func=run_set)
     pa = subparsers.add_parser('abort', help='Discard an interrupted transfer on the remote: <dataset>'); pa.add_argument('dataset'); pa.set_defaults(func=run_abort)
     pf = subparsers.add_parser('forget', help='Stop managing a dataset (data is kept): <dataset>'); pf.add_argument('dataset'); pf.set_defaults(func=run_forget)
-    pr = subparsers.add_parser('restore', help='Recreate a dataset from the remote: <host:pool/dataset> <dataset> [--latest]'); pr.add_argument('remote'); pr.add_argument('local_dataset'); pr.add_argument('--latest', action='store_true'); pr.set_defaults(func=run_restore)
+    pr = subparsers.add_parser('restore', help='Recreate a dataset from the remote: <host:pool/dataset> <dataset> [--at SNAPSHOT|TIME] [--latest]',
+                               description='Recreate a dataset (and its children) from the replica, by default as of its newest snapshot.')
+    pr.add_argument('remote'); pr.add_argument('local_dataset')
+    pr.add_argument('--at', metavar='SNAPSHOT|TIME', help="restore as of an earlier point: a snapshot name (see 'zz snaps') "
+                    "or a local time such as '2026-09-28 01:00' (the newest snapshot at or before it)")
+    pr.add_argument('--rollback-remote', action='store_true', help="with --at: roll the replica back to that point, "
+                    "permanently deleting its newer snapshots, so replication can continue")
+    pr.add_argument('--latest', action='store_true', help='restore only the chosen snapshot, without earlier history')
+    pr.set_defaults(func=run_restore)
     args = parser.parse_args()
     if not hasattr(args, 'func'): parser.print_help(); return
     if args.func(args): sys.exit(1)

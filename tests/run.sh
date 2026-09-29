@@ -465,6 +465,49 @@ if [ $SKIP = 0 ]; then
     check "…whole tree intact"              tree_ok
 fi
 
+T restore_point_in_time
+if [ $SKIP = 0 ]; then
+    # The ransomware case: good data, then damage that replicates, then restore from before it
+    P=$SRC/pit; PR=$DST/bk/pit
+    zfs create "$P"; echo "good data" > "$(mnt "$P")/doc"
+    run init "$P" "zzremote:$PR" --freq 1h
+    good=$(newest "$P"); good_time=$(date -d "@$(zfs get -H -p -o value creation "$P@$good")" '+%Y-%m-%d %H:%M:%S')
+    tick; echo "ENCRYPTED BY RANSOMWARE" > "$(mnt "$P")/doc"; run sync "$P" --now
+    tick; echo "still encrypted" > "$(mnt "$P")/doc2"; run sync "$P" --now
+    bad=$(newest "$P"); nrep=$(nsnaps "$PR")
+
+    wipe "$P"
+    run restore "zzremote:$PR" "$P" --at "$good_time"
+    check "restore --at <time> succeeds"    rc_is 0
+    check "…picks the newest snapshot at or before that time" out_has "Restore point: @$good"
+    check "…data is from before the damage" [ "$(cat "$(mnt "$P")/doc")" = "good data" ]
+    check "…later files aren't there"       [ ! -e "$(mnt "$P")/doc2" ]
+    check "…left unmanaged by default"      [ -z "$(prop target "$P")" ]
+    check "…explains both ways to continue" out_has "--rollback-remote"
+    check "…replica untouched"              [ "$(nsnaps "$PR")" = "$nrep" ]
+
+    run restore "zzremote:$PR" "$P" --at "$good" --rollback-remote
+    check "rerun with --rollback-remote succeeds" rc_is 0
+    check "…replica rolled back to the restore point" [ "$(newest "$PR")" = "$good" ]
+    check "…damaged snapshots gone from the replica" bash -c "! zfs list '$PR@$bad' >/dev/null 2>&1"
+    check "…managed again"                  [ "$(prop target "$P")" = "zzremote:$PR" ]
+    check "…bridge held on both sides"      [ "$(held "$P")" = "$P@$good" ] && [ "$(held "$PR")" = "$PR@$good" ]
+    check "…data still good"                [ "$(cat "$(mnt "$P")/doc")" = "good data" ]
+    echo "recovered" > "$(mnt "$P")/doc3"; tick; run sync "$P" --now
+    check "replication continues from the restore point" rc_is 0
+    check "…new snapshot reaches the replica" [ "$(newest "$PR")" = "$(newest "$P")" ]
+
+    wipe "$P"
+    run restore "zzremote:$PR" "$P" --at zz_auto_1
+    check "--at unknown snapshot fails"     rc_is 1
+    run restore "zzremote:$PR" "$P" --at "2001-01-01 00:00"
+    check "--at before the oldest snapshot fails" rc_is 1
+    check "…and says which is oldest"      out_has "the oldest is"
+    run restore "zzremote:$PR" "$P" --at "last tuesday"
+    check "--at with an unreadable time fails" rc_is 1
+    check "…nothing was created"            bash -c "! zfs list '$P' >/dev/null 2>&1"
+fi
+
 T forget
 if [ $SKIP = 0 ]; then
     run forget "$DS"

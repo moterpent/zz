@@ -128,6 +128,7 @@ zz restore backup-server:pool/data tank/data
 * Restores the newest `zz_auto_` snapshot with its full history (`--latest` for just that snapshot), mounts it, and makes it the managed primary again; the next `zz sync` resumes replication incrementally.
 * If a restore is interrupted, run the same command again to resume it.
 * Refuses to overwrite an existing dataset. Restoring to a different name while the original still replicates to that remote leaves the copy unmanaged.
+* **Restore to an earlier point** with `--at`, for example when ransomware or a mistake has already replicated: `zz restore backup-server:pool/data tank/data --at "2026-09-28 01:00"` (the newest snapshot at or before that time), or `--at zz_auto_1790626501` (see `zz snaps`). The result is left unmanaged and the replica isn't touched; zz then shows two ways to continue: replicate to a new target, keeping the replica's history, or re-run with `--rollback-remote` to roll the replica back to that point, permanently deleting its newer snapshots, and resume replication.
 * Child datasets are restored with it, and the whole tree is verified before the restore reports success. Children that had been deleted on the primary are left out (see Deleted Child Datasets below), and restore says where to find them.
 
 ### 5. Stop Tracking (Forget)
@@ -165,7 +166,7 @@ Commands:
     set       Change a setting: <dataset> <prop> <value>
     abort     Discard an interrupted transfer on the remote: <dataset>
     forget    Stop managing a dataset (data is kept): <dataset>
-    restore   Recreate a dataset from the remote: <host:pool/dataset> <dataset> [--latest]
+    restore   Recreate a dataset from the remote: <host:pool/dataset> <dataset> [--at SNAPSHOT|TIME] [--latest]
 
 Durations: 30m, 1h, 7d, 2w, 1y (a bare number means minutes).
 
@@ -181,7 +182,7 @@ Every push runs two suites on GitHub Actions:
   ```bash
   python3 tests/test_units.py
   ```
-* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, send flags (compressed, large-block, encrypted raw, and pre-0.5 replications), child datasets (created, deleted, aged out, restored), concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
+* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, send flags (compressed, large-block, encrypted raw, and pre-0.5 replications), child datasets (created, deleted, aged out, restored), point-in-time restore, concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
   ```bash
   sudo tests/run.sh             # everything (about 2 minutes)
   sudo tests/run.sh restore     # only tests whose name contains "restore"
