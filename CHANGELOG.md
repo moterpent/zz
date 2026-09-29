@@ -2,6 +2,11 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.8.1] - 2026-09-29
+
+### Fixed
+- **A restore interrupted while receiving a child dataset couldn't be resumed.** The resume token was left on the child, but restore only checked the top dataset for one, so a re-run stopped with "exists but has no zz snapshots" (or kept failing on the child's partial state). Restore now resumes interrupted receives anywhere in the local tree. This is the restore-side counterpart of the 0.8.0 sync fix.
+
 ## [0.8.0] - 2026-09-29
 
 Crash safety: dying at any step (crash, `kill -9`, power loss) now leaves a state that the next sync, or re-running the same command, recovers from.
@@ -89,6 +94,7 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.8.1]: https://github.com/moterpent/zz/releases/tag/v0.8.1
 [0.8.0]: https://github.com/moterpent/zz/releases/tag/v0.8.0
 [0.7.4]: https://github.com/moterpent/zz/releases/tag/v0.7.4
 [0.7.3]: https://github.com/moterpent/zz/releases/tag/v0.7.3

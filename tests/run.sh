@@ -741,6 +741,25 @@ if [ $SKIP = 0 ]; then
     check "…and replication continues"      rc_is 0
 fi
 
+T restore_crash_in_child
+if [ $SKIP = 0 ]; then
+    # A restore that dies while receiving a CHILD dataset leaves the resume token on that child.
+    tokens() { zfs get -H -r -o name,value receive_resume_token "$1" | awk -F'\t' '$1 !~ /@/ && $2 != "-"' | grep -c .; }
+    Q=$SRC/rq; QR=$DST/bk/rq; zfs create "$Q"; zfs create "$Q/c"
+    head -c 100K /dev/urandom > "$(mnt "$Q")/f"; head -c 8M /dev/urandom > "$(mnt "$Q/c")/f"
+    run init "$Q" "zzremote:$QR" --freq 1h
+    head -c 8M /dev/urandom > "$(mnt "$Q/c")/g"; tick; run sync "$Q" --now
+    (cd "$(mnt "$Q/c")" && sha256sum f g) > "$WORK/rq_sums"
+    wipe "$Q"
+    # Full recursive stream cut partway through the child (the top dataset is small, the child large)
+    zfs send -R -L -c "$QR@$(newest "$QR")" 2>/dev/null | head -c 6M | zfs recv -s -u "$Q" 2>/dev/null
+    check "setup: top arrived, the child holds a partial receive" [ "$(tokens "$Q")" -ge 1 ]
+    run restore "zzremote:$QR" "$Q"
+    check "re-running restore finishes the child's interrupted receive" rc_is 0
+    check "…no tokens left"                 [ "$(tokens "$Q")" = 0 ]
+    check "…child's data intact"            bash -c "cd '$(mnt "$Q/c")' 2>/dev/null && sha256sum -c --quiet '$WORK/rq_sums'"
+fi
+
 T forget
 if [ $SKIP = 0 ]; then
     run forget "$DS"

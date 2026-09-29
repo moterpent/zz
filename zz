@@ -15,7 +15,7 @@ import threading
 import shlex
 import contextlib
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -888,16 +888,12 @@ def run_restore(args):
     exclude = ["-X", ",".join(stale)] if stale else []
     local_name = lambda k: local_ds + k[len(remote_ds):]
 
-    # 1. Finish an interrupted receive, if there is one
-    try: token = subprocess.check_output(["zfs", "get", "-H", "-o", "value", "receive_resume_token", local_ds],
-                                         encoding='utf-8', stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError: token = "-"
+    # 1. Finish interrupted receives anywhere in the local tree. A restore that died while
+    #    receiving a child leaves the resume token on that child, not on the top dataset.
+    toks = remote_tokens(None, local_ds)             # host None: the local tree
+    top_partial = any(n == local_ds for n, _ in toks)
     exists = subprocess.run(["zfs", "list", local_ds], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    if token != "-":
-        print(f"[*] Resuming interrupted restore...", flush=True)
-        if run_transfer(zfs_on(remote_host, "send", "-v", "-t", token), recv_cmd) != 0:
-            print("[!] Restore interrupted again. Run the same command to resume.", flush=True); return True
-    elif exists:
+    if exists and not top_partial:
         # Only continue into an existing dataset if it is an unfinished restore from this remote
         local_snaps = zz_snaps(local_ds)
         if ZzDataset(local_ds).target != "-" or not local_snaps or \
@@ -906,7 +902,11 @@ def run_restore(args):
                   f"Refusing to overwrite it; rename or destroy it, or restore to another name.", flush=True)
             return True
         print(f"[*] Continuing partial restore (have @{local_snaps[0]})...", flush=True)
-    else:
+    for lds, token in toks:
+        print(f"[*] Resuming interrupted restore into {lds}...", flush=True)
+        if run_transfer(zfs_on(remote_host, "send", "-v", "-t", token), ["zfs", "recv", "-s", "-u", lds]) != 0:
+            print("[!] Restore interrupted again. Run the same command to resume.", flush=True); return True
+    if not exists and not toks:
         mode = "latest snapshot only" if args.latest else "full history"
         print(f"[*] Restoring @{latest} ({mode})...", flush=True)
         send = (["-v"] if args.latest else ["-R", "-v"] + exclude) + rflags + [f"{remote_ds}@{latest}"]
