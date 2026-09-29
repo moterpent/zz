@@ -193,6 +193,34 @@ if [ $SKIP = 0 ]; then
     check "holds restored if removed (self-heal)" [ "$(held "$DS")" = "$DS@$nb" ] && [ "$(held "$RP")" = "$RP@$nb" ]
 fi
 
+T set_rules
+if [ $SKIP = 0 ]; then
+    zfs create "$SRC/plain2"
+    run set "$SRC/plain2" freq 1h
+    check "set refuses an unmanaged dataset" rc_is 1
+    check "…says it isn't managed"          out_has "not managed by zz"
+    check "…and leaves no stray property"   [ -z "$(zfs get -H -s local -o value zz:freq "$SRC/plain2")" ]
+    run set "$SRC/plain2" target "zzremote:$DST/bk/plain2"
+    check "set target can't make a dataset managed without init" [ -z "$(prop target "$SRC/plain2")" ]
+    zfs destroy "$SRC/plain2"
+
+    zfs create "$DST/bk/other"
+    run set "$DS" target "zzremote:$DST/bk/other"
+    check "set target refuses a different replica" rc_is 1
+    check "…explains, and points to forget + init" out_has "zz forget $DS, then zz init"
+    check "…target unchanged"               [ "$(prop target "$DS")" = "$TARGET" ]
+    run set "$DS" target "zzremote:$DST/bk/nothing"
+    check "set target refuses a path that doesn't exist" out_has "does not exist"
+    zfs destroy "$DST/bk/other"
+
+    run set "$DS" target "zzalias:$RP"          # same replica, reached by another name
+    check "set target accepts the same replica under another name" rc_is 0
+    tick; run sync "$DS" --now
+    check "…and syncing carries on"         rc_is 0
+    run set "$DS" target "$TARGET"
+    check "…and back again"                 rc_is 0
+fi
+
 T now_keeps_schedule
 if [ $SKIP = 0 ]; then
     anchor=$(prop last_sync); n=$(nsnaps "$DS"); tick

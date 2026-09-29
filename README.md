@@ -141,6 +141,7 @@ Update a setting without re-initializing:
 ```bash
 zz set tank/data freq 15m
 ```
+`set` only works on datasets zz manages (start with `zz init`). `set target` is for reaching the **same** replica by another name (a new hostname, IP address or ssh alias): zz checks that the new location has the bridge snapshot, with the same GUID, before accepting it. To replicate somewhere new, `zz forget` the dataset and `zz init` it with the new target.
 ### 7. View the current "contract" for a specific dataset:
 ```bash
 zz meta tank/data

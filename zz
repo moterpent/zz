@@ -15,7 +15,7 @@ import threading
 import shlex
 import contextlib
 
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -1095,14 +1095,27 @@ def run_meta(args):
             except ValueError: val = f"{val} (INVALID)"
         print(f"{d:<22} | {k:<12} | {val}", flush=True)
 
+def same_replica(ds, host, path):
+    """None if host:path holds the same replica as the current target (it has the bridge snapshot
+    with the same GUID), else the reason it doesn't."""
+    try: held = held_bridges(ds.name)
+    except subprocess.CalledProcessError: held = set()
+    bridge = sorted(held)[-1] if held else (f"zz_auto_{ds.last_sent}" if ds.last_sent else None)
+    if not bridge: return "the current bridge snapshot is unknown (run a sync first)"
+    mine = snap_guid(f"{ds.name}@{bridge}")
+    if not mine: return f"the bridge snapshot @{bridge} is missing locally"
+    probe = subprocess.run(zfs_on(host, "list", "-H", "-o", "name", path), capture_output=True, text=True)
+    if probe.returncode == 255: return f"could not reach {host} over ssh"
+    if probe.returncode != 0: return f"{path} does not exist on {host}"
+    theirs = snap_guid(f"{path}@{bridge}", host)
+    if theirs != mine: return f"{host}:{path} doesn't have the bridge snapshot @{bridge}, so it isn't this dataset's replica"
+    return None
+
 def run_set(args):
     args.value = " ".join(args.value).strip()
-    try: check_dataset(args.dataset)
-    except ValueError as e: print(f"[!] {e}", flush=True); return True
+    ds = managed_dataset(args.dataset)       # validates the name; refuses unmanaged datasets
+    if not ds: return True
     if not args.value: print("[!] Not updated: a value is required.", flush=True); return True
-    ds = ZzDataset(args.dataset)
-    if ds.props is None:
-        print(f"[!] Error: Dataset '{args.dataset}' not found.", flush=True); return True
     try:
         if args.prop in ('freq', 'keep_local', 'keep_remote'): parse_duration(args.value)
         elif args.prop == 'keep_min': keep_min_arg(args.value)
@@ -1110,6 +1123,15 @@ def run_set(args):
         elif args.prop == 'send_flags': parse_send_flags(args.value)
     except (ValueError, argparse.ArgumentTypeError) as e:
         print(f"[!] Not updated: {e}", flush=True); return True
+    if args.prop == 'target' and args.value != ds.target:
+        # Only for reaching the same replica by another name (new hostname, IP or ssh alias).
+        # A different replica would lack the bridge snapshot and break replication.
+        why = same_replica(ds, *parse_target(args.value))
+        if why:
+            print(f"[!] Not updated: {why}.\n"
+                  f"    set target is for reaching the same replica by another name (a new hostname, IP or ssh alias).\n"
+                  f"    To replicate somewhere new: zz forget {ds.name}, then zz init {ds.name} {args.value}", flush=True)
+            return True
     ds.set_prop(args.prop, args.value); print(f"[*] Updated {args.prop} to {args.value}", flush=True)
     if args.prop == 'send_flags':
         print("    Note: if the next sync fails with a message about flags not matching a previous receive,\n"

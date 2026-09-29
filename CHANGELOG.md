@@ -2,6 +2,12 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.7.3] - 2026-09-28
+
+### Fixed
+- `zz set` worked on datasets zz doesn't manage: it left stray `zz:` properties, and `set target` made a dataset "managed" without `init`, after which every sync failed. It now refuses unmanaged datasets, like the other commands.
+- `zz set target` accepted any location. Pointing it at a different replica broke replication on the next sync, since that location lacks the bridge snapshot. It now only accepts a location that has the current bridge snapshot with the same GUID (the same replica under another name), and otherwise points to `zz forget` + `zz init`.
+
 ## [0.7.2] - 2026-09-28
 
 ### Fixed
@@ -64,6 +70,7 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.7.3]: https://github.com/moterpent/zz/releases/tag/v0.7.3
 [0.7.2]: https://github.com/moterpent/zz/releases/tag/v0.7.2
 [0.7.1]: https://github.com/moterpent/zz/releases/tag/v0.7.1
 [0.7.0]: https://github.com/moterpent/zz/releases/tag/v0.7.0
