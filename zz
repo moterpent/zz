@@ -15,7 +15,7 @@ import threading
 import shlex
 import contextlib
 
-__version__ = "0.7.4"
+__version__ = "0.8.0"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -267,6 +267,28 @@ def get_managed_datasets():
 
 # --- Actions ---
 
+def crash_point(label):
+    """Test hook: exit here as abruptly as kill -9 would, when ZZTEST_CRASH_AT=<label>."""
+    if os.environ.get("ZZTEST_CRASH_AT") == label:
+        sys.stdout.flush(); os._exit(137)
+
+def remote_tokens(host, path):
+    """[(dataset, token)] for datasets in the replica tree holding an interrupted receive, parents first."""
+    try:
+        res = subprocess.check_output(zfs_on(host, "get", "-H", "-r", "-o", "name,value", "receive_resume_token", path),
+                                      encoding='utf-8', stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError: return []
+    return [(n, t) for n, t in (l.split('\t') for l in res.splitlines() if l) if '@' not in n and t not in ("-", "")]
+
+def resume_remote(host, path, label):
+    """Finish interrupted receives anywhere in the replica tree (a crash inside a child dataset
+    leaves the token on that child). Returns an error message or None."""
+    for rds, token in remote_tokens(host, path):
+        print(f"[*] {label}: Resuming interrupted transfer into {rds}...", flush=True)
+        if run_transfer(["zfs", "send", "-t", token], zfs_on(host, "recv", "-s", "-u", rds), summary=f"{rds} (resumed)") != 0:
+            return f"Resume of interrupted transfer into {rds} failed."
+    return None
+
 def get_token(host, dataset):
     try:
         cmd = zfs_on(host, "get", "-H", "-o", "value", "receive_resume_token", dataset)
@@ -360,6 +382,7 @@ def pin_bridge(dataset, bridge, host=None):
         if bridge and bridge not in held:
             subprocess.run(zfs_on(host, "hold", "-r", HOLD_TAG, f"{dataset}@{bridge}"), check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            crash_point("pin:after-hold")
         for old in held - {bridge}:
             subprocess.run(zfs_on(host, "release", "-r", HOLD_TAG, f"{dataset}@{old}"), check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -476,6 +499,28 @@ def init_failed(reason, hint=None):
     if hint: print(f"    {hint}", flush=True)
     return True
 
+def fill_remote(local_ds, host, rpath, snap, flags):
+    """Make sure every dataset in the local tree reaches the replica at @snap. An interrupted
+    recursive send can leave children missing or behind; send those individually (a missing
+    child with its subtree). Returns an error message or None."""
+    names = subprocess.check_output(["zfs", "list", "-H", "-o", "name", "-r", local_ds], encoding='utf-8').split()
+    for l in names:
+        if subprocess.run(["zfs", "list", f"{l}@{snap}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            continue                                   # created after @snap; the next sync sends it
+        r = rpath + l[len(local_ds):]
+        try: have = zz_snaps(r, host)
+        except subprocess.CalledProcessError: have = None
+        if have and snap in have: continue
+        if have is None:
+            print(f"[*] Sending missing {l} -> {r}...", flush=True)
+            send = ["zfs", "send", "-R"] + flags + [f"{l}@{snap}"]
+        else:
+            print(f"[*] Catching up {r} @{have[0]} -> @{snap}...", flush=True)
+            send = ["zfs", "send"] + flags + ["-I", f"@{have[0]}", f"{l}@{snap}"]
+        if run_transfer(send, zfs_on(host, "recv", "-s", "-u", r)) != 0:
+            return f"sending {l} did not complete"
+    return None
+
 @locked_on(lambda args: args.dataset)
 def run_init(args):
     try: check_dataset(args.dataset)
@@ -484,63 +529,76 @@ def run_init(args):
     if ds.props is None: return init_failed(f"dataset '{args.dataset}' not found.")
     try: remote_host, remote_path = parse_target(args.remote)
     except ValueError as e: return init_failed(str(e))
+    if ds.target != "-":
+        if ds.target == args.remote:
+            print(f"[*] {args.dataset} is already replicating to {args.remote}.", flush=True)
+            init_done(args.dataset, args.remote); return
+        return init_failed(f"{args.dataset} is already managed by zz, replicating to {ds.target}.",
+                           f"To change that: zz set (same replica, new name) or zz forget {args.dataset}, then init.")
     recv_cmd = zfs_on(remote_host, "recv", "-s", "-u", *REPLICA_RECV_OPTS, remote_path)
+    flags = args.send_flags if args.send_flags is not None else default_send_flags(args.dataset)
 
     if is_busy_local(args.dataset) or is_token_active(remote_host, remote_path):
         return init_failed(f"a transfer for {args.dataset} is already running.", "Wait for it to finish, then run init again.")
 
-    token = get_token(remote_host, remote_path)
-    if token != "-":
-        print(f"[*] Resuming initial sync...", flush=True)
-        send_cmd = ["zfs", "send", "-v", "-t", token]
-        if run_transfer(send_cmd, recv_cmd) != 0:
-            return init_failed("the initial transfer was interrupted again.", "Run the same command again to resume it.")
-        ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq); ds.set_prop("last_sync", int(time.time()))
-        try: snaps = zz_snaps(remote_path, remote_host)
-        except subprocess.CalledProcessError: snaps = []
-        if snaps:
-            ds.record_sent(snaps[0])
-            for host, path in ((None, args.dataset), (remote_host, remote_path)):
-                err = pin_bridge(path, snaps[0], host)
-                if err: print(f"    [!] {err}", flush=True)
-        init_done(args.dataset, args.remote)
-        return
-
-    probe = subprocess.run(zfs_on(remote_host, "list", "-H", "-o", "name", remote_path),
-                           capture_output=True, text=True)
-    if probe.returncode == 0:
-        return init_failed(f"{remote_path} already exists on {remote_host}; refusing to overwrite it.",
-                           "Choose a different remote path, or remove the existing one first.")
+    # The dataset only becomes managed (zz:target) at the very end, so a crash part-way never
+    # leaves a half-set-up dataset for cron to trip over; running init again picks up from here.
+    probe = subprocess.run(zfs_on(remote_host, "list", "-H", "-o", "name", remote_path), capture_output=True, text=True)
     if probe.returncode == 255:   # ssh's own failure code
         return init_failed(f"could not reach {remote_host} over ssh.",
                            f"Check with: ssh {remote_host} zfs list   (key-based login is required)")
-    parent = remote_path.rsplit('/', 1)[0]
-    if '/' in parent:
-        mk = subprocess.run(zfs_on(remote_host, "create", "-p", parent), capture_output=True, text=True)
-        if mk.returncode != 0:
-            return init_failed(f"could not create {parent} on {remote_host}: {mk.stderr.strip()}")
+    if remote_tokens(remote_host, remote_path):
+        print(f"[*] Resuming the interrupted initial transfer...", flush=True)
+        err = resume_remote(remote_host, remote_path, args.dataset)
+        if err: return init_failed(err, "Run the same command again to resume it.")
+    elif probe.returncode == 0:
+        # Adopt a replica left by an interrupted init, but only if it is a copy of this dataset
+        try: theirs = zz_snaps(remote_path, remote_host)
+        except subprocess.CalledProcessError: theirs = []
+        if not theirs or snap_guid(f"{args.dataset}@{theirs[0]}") != snap_guid(f"{remote_path}@{theirs[0]}", remote_host):
+            return init_failed(f"{remote_path} already exists on {remote_host}; refusing to overwrite it.",
+                               "Choose a different remote path, or remove the existing one first.")
+        print(f"[*] {remote_host}:{remote_path} is already a replica of {args.dataset} "
+              f"(from an interrupted init?); finishing the setup.", flush=True)
+    else:
+        parent = remote_path.rsplit('/', 1)[0]
+        if '/' in parent:
+            mk = subprocess.run(zfs_on(remote_host, "create", "-p", parent), capture_output=True, text=True)
+            if mk.returncode != 0:
+                return init_failed(f"could not create {parent} on {remote_host}: {mk.stderr.strip()}")
+        snap = f"zz_auto_{int(time.time())}"
+        print(f"[*] Creating initial snapshot: {args.dataset}@{snap}", flush=True)
+        # Reuse it if an interrupted init already made one this second
+        if subprocess.run(["zfs", "list", f"{args.dataset}@{snap}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            mk = subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], capture_output=True, text=True)
+            if mk.returncode != 0:
+                return init_failed(f"could not create the initial snapshot: {mk.stderr.strip()}")
+        crash_point("init:after-snapshot")
+        print(f"[*] Starting initial transfer (Resumable)...", flush=True)
+        print(f"    send flags: {flags or 'none'}", flush=True)
+        send_cmd = ["zfs", "send", "-R", "-v"] + parse_send_flags(flags) + [f"{args.dataset}@{snap}"]
+        if run_transfer(send_cmd, recv_cmd) != 0:
+            return init_failed("the initial transfer did not complete.",
+                               "If it was interrupted, run the same command again to resume it.")
+        crash_point("init:after-transfer")
 
-    ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq)
-    ds.set_prop("keep_local", args.keep_local); ds.set_prop("keep_remote", args.keep_remote); ds.set_prop("keep_min", args.keep_min)
-    flags = args.send_flags if args.send_flags is not None else default_send_flags(args.dataset)
-    ds.set_prop("send_flags", flags or "none")
-    snap = f"zz_auto_{int(time.time())}"
-    print(f"[*] Creating initial snapshot: {args.dataset}@{snap}", flush=True)
-    mk = subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], capture_output=True, text=True)
-    if mk.returncode != 0:
-        return init_failed(f"could not create the initial snapshot: {mk.stderr.strip()}")
+    try: snap = zz_snaps(remote_path, remote_host)[0]
+    except (subprocess.CalledProcessError, IndexError):
+        return init_failed(f"no zz snapshot arrived on {remote_host}:{remote_path}.", "Run the same command again.")
+    err = fill_remote(args.dataset, remote_host, remote_path, snap, parse_send_flags(flags))
+    if err: return init_failed(err + ".", "Run the same command again to resume it.")
 
-    print(f"[*] Starting initial transfer (Resumable)...", flush=True)
-    print(f"    send flags: {flags or 'none'}", flush=True)
-    send_cmd = ["zfs", "send", "-R", "-v"] + parse_send_flags(flags) + [f"{args.dataset}@{snap}"]
-    if run_transfer(send_cmd, recv_cmd) != 0:
-        return init_failed("the initial transfer did not complete.",
-                           "If it was interrupted, run the same command again to resume it.")
-    ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap)
+    # Finish: settings first, the target last (that is what makes the dataset managed)
     replica_noauto(remote_host, remote_path)
+    ds.set_prop("freq", args.freq)
+    crash_point("init:mid-finalize")
+    ds.set_prop("keep_local", args.keep_local); ds.set_prop("keep_remote", args.keep_remote); ds.set_prop("keep_min", args.keep_min)
+    ds.set_prop("send_flags", flags or "none")
+    ds.set_prop("last_sync", snap_time(snap) or int(time.time())); ds.record_sent(snap)
     for host, path in ((None, args.dataset), (remote_host, remote_path)):
         err = pin_bridge(path, snap, host)
         if err: print(f"    [!] {err}", flush=True)
+    ds.set_prop("target", args.remote)
     init_done(args.dataset, args.remote)
 
 def run_sync(args):
@@ -589,6 +647,7 @@ def run_sync(args):
                 print(f"[*] {name}: Taking {kind} snapshot @{new_snap_tag}...", flush=True)
                 try:
                     subprocess.run(["zfs", "snapshot", "-r", f"{ds.name}@{new_snap_tag}"], check=True)
+                    crash_point("sync:after-snapshot")
                     # last_sync anchors the schedule, so only a due snapshot moves it; an on-demand
                     # one leaves the cadence alone. Set it now so a long transfer can't double-snap.
                     if due: ds.set_prop("last_sync", now_ts)
@@ -620,13 +679,10 @@ def run_sync(args):
         # --- PHASE 3: DELTA DISCOVERY ---
 
         # Handle interrupted/resumable transfers first
-        token = get_token(remote_host, remote_path)
-        if token != "-":
-            print(f"[*] {name}: Resuming interrupted transfer...", flush=True)
-            send_cmd = ["zfs", "send", "-t", token]
-            if run_transfer(send_cmd, recv_cmd, summary=f"{name} (resumed)") != 0:
-                ds.record_error("Resume of interrupted transfer failed."); failed = True
-                lock_f.close(); continue
+        err = resume_remote(remote_host, remote_path, name)
+        if err:
+            ds.record_error(err); failed = True
+            lock_f.close(); continue
 
         # Identify the "Bridge" (latest common snapshot)
         try:
@@ -686,6 +742,7 @@ def run_sync(args):
                     break
                 current_base = next_tag
 
+        crash_point("sync:after-send")
         # New child datasets may have arrived with these sends
         if current_base != bridge: replica_noauto(remote_host, remote_path)
 
@@ -720,7 +777,10 @@ def run_forget(args):
     for host, path in ((None, ds.name),) + (((remote[0], remote[1]),) if remote else ()):
         err = pin_bridge(path, None, host)
         if err: print(f"    [!] {err} Release it with: zfs release -r {HOLD_TAG} <snapshot>", flush=True); failed = True
-    for prop in list(ds.props.keys()): subprocess.run(["zfs", "inherit", prop, ds.name])
+    # zz:target last: if interrupted, the dataset is still managed and forget can simply be re-run
+    for prop in sorted(ds.props.keys(), key=lambda p: p == "zz:target"):
+        subprocess.run(["zfs", "inherit", prop, ds.name])
+        crash_point("forget:mid-inherit")
     print(f"[+] {ds.name} is no longer managed by zz. Its data and snapshots were kept.", flush=True)
     return failed
 
@@ -824,6 +884,7 @@ def run_restore(args):
             for k in missing:
                 if f"{k}@{latest}" not in snaps_temp:
                     subprocess.run(zfs_on(remote_host, "snapshot", "-o", "zz:restore_temp=on", f"{k}@{latest}"), check=True)
+                    crash_point("restore:after-temp")
     exclude = ["-X", ",".join(stale)] if stale else []
     local_name = lambda k: local_ds + k[len(remote_ds):]
 
@@ -839,7 +900,7 @@ def run_restore(args):
     elif exists:
         # Only continue into an existing dataset if it is an unfinished restore from this remote
         local_snaps = zz_snaps(local_ds)
-        if ZzDataset(local_ds).props or not local_snaps or \
+        if ZzDataset(local_ds).target != "-" or not local_snaps or \
            snap_guid(f"{local_ds}@{local_snaps[0]}") != snap_guid(f"{remote_ds}@{local_snaps[0]}", remote_host):
             print(f"[!] {local_ds} already exists and is not a partial restore from {args.remote}. "
                   f"Refusing to overwrite it; rename or destroy it, or restore to another name.", flush=True)
@@ -888,6 +949,7 @@ def run_restore(args):
         print(f"[!] Restore incomplete: not at @{latest}: {', '.join(behind)}. Run the same command again.", flush=True)
         return True
 
+    crash_point("restore:after-data")
     # Remove the temporary snapshots from stale children (before holds are placed on @latest)
     for k in missing:
         subprocess.run(zfs_on(remote_host, "destroy", f"{k}@{latest}"), stderr=subprocess.DEVNULL)
@@ -910,18 +972,26 @@ def run_restore(args):
                                            encoding='utf-8').split()
         except subprocess.CalledProcessError:
             print(f"[!] Could not list snapshots on {remote_host}.", flush=True); return True
-        for n in [x.split('@')[0] for x in tree if x.endswith(f"@{latest}")]:
+        # Children first, the top dataset last: if this is interrupted, the top still has newer
+        # snapshots, so running the same restore again repeats the whole rollback
+        names = sorted({x.split('@')[0] for x in tree if x.endswith(f"@{latest}")}, key=lambda n: n.count('/'), reverse=True)
+        for n in names:
             rb = subprocess.run(zfs_on(remote_host, "rollback", "-r", f"{n}@{latest}"), capture_output=True, text=True)
             if rb.returncode != 0:
                 print(f"[!] Could not roll back {n}: {rb.stderr.strip()}", flush=True); return True
+            crash_point("restore:mid-rollback")
         rolled_back = True
     if not owners and (not newer or rolled_back):
         ds = ZzDataset(local_ds)
-        for pk, pv in remote_props.items(): ds.set_prop(pk.split(':', 1)[1], pv)
-        ds.set_prop("target", args.remote); ds.set_prop("last_sync", int(time.time())); ds.record_sent(latest)
+        for pk, pv in remote_props.items():
+            if pk == "zz:target": continue                 # set last, below
+            ds.set_prop(pk.split(':', 1)[1], pv)
+            crash_point("restore:mid-props")
+        ds.set_prop("last_sync", int(time.time())); ds.record_sent(latest)
         for host, path in ((None, local_ds), (remote_host, remote_ds)):
             err = pin_bridge(path, latest, host)
             if err: print(f"    [!] {err}", flush=True)
+        ds.set_prop("target", args.remote)                 # what makes it managed: last
     res = subprocess.check_output(["zfs", "list", "-H", "-o", "name,canmount,mounted,keystatus", "-r", local_ds], encoding='utf-8')
     locked = []
     for n, canmount, mounted, keystatus in (l.split('\t') for l in res.splitlines() if l):
@@ -1148,11 +1218,12 @@ def run_abort(args):
     if not ds: return True
     try: remote_host, remote_path = parse_target(ds.target)
     except ValueError as e: print(f"[!] {e}", flush=True); return True
-    if get_token(remote_host, remote_path) == "-":
+    toks = remote_tokens(remote_host, remote_path)
+    if not toks:
         print(f"[*] No interrupted transfer on {remote_host}:{remote_path}; nothing to abort.", flush=True); return
-    if subprocess.run(zfs_on(remote_host, "recv", "-A", remote_path)).returncode != 0:
-        print("[!] Could not clear the resume token.", flush=True); return True
-    print("[+] Resume token cleared.", flush=True)
+    bad = [rds for rds, _ in toks if subprocess.run(zfs_on(remote_host, "recv", "-A", rds)).returncode != 0]
+    if bad: print(f"[!] Could not clear the resume token on: {', '.join(bad)}", flush=True); return True
+    print(f"[+] Resume token cleared on: {', '.join(r for r, _ in toks)}", flush=True)
 
 class QuietPipe:
     """stdout wrapper: if the reader goes away (zz snaps | head), discard further output instead

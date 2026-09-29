@@ -2,6 +2,20 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.8.0] - 2026-09-29
+
+Crash safety: dying at any step (crash, `kill -9`, power loss) now leaves a state that the next sync, or re-running the same command, recovers from.
+
+### Fixed
+- **Interrupted receives inside child datasets.** A transfer cut off inside a child left the resume token on that child, but zz only checked the top dataset: sync reported "up to date" while the child was missing the snapshot, and later sends into it failed until someone ran `zfs recv -A` by hand. Sync now resumes interrupted receives anywhere in the replica tree, and `zz abort` clears them all.
+- **`init` interrupted part-way.** It used to mark the dataset managed before the initial transfer, so a crash left cron syncing a dataset with no replica, and re-running `init` after a completed transfer refused ("already exists"). The dataset now becomes managed only at the very end; re-running `init` resumes an interrupted transfer, fills in any child datasets that didn't arrive, and adopts a replica an interrupted run left behind (verified by snapshot GUID). Re-running `init` on a dataset that's already set up is harmless.
+- **`restore` interrupted while writing settings** left `zz:` properties that made a re-run refuse; re-runs now only refuse a dataset that's actually managed, and the target is written last.
+- **`restore --rollback-remote` interrupted** after rolling back the top dataset left children un-rolled-back on a re-run; children are now rolled back first.
+- **`forget` interrupted** after removing `zz:target` left stray properties that a re-run refused to clean up; `zz:target` is now removed last.
+
+### Tests
+- A test-only crash hook (`ZZTEST_CRASH_AT`) makes zz exit abruptly at named steps; a new scenario crashes `init`, `sync`, `forget` and `restore` at each step and checks the recovery, plus interrupted receives inside a child dataset.
+
 ## [0.7.4] - 2026-09-28
 
 ### Fixed
@@ -75,6 +89,7 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.8.0]: https://github.com/moterpent/zz/releases/tag/v0.8.0
 [0.7.4]: https://github.com/moterpent/zz/releases/tag/v0.7.4
 [0.7.3]: https://github.com/moterpent/zz/releases/tag/v0.7.3
 [0.7.2]: https://github.com/moterpent/zz/releases/tag/v0.7.2

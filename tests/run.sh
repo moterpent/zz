@@ -119,8 +119,13 @@ if [ $SKIP = 0 ] || true; then   # always runs: everything depends on it
     check "replica won't auto-mount"      [ "$(val canmount "$RP")" = noauto ]
     check "replica is read-only"          [ "$(val readonly "$RP")" = on ]
     run init "$DS" "$TARGET"
-    check "second init refuses existing remote"   rc_is 1
+    check "re-running init on a set-up dataset is harmless" rc_is 0
+    check "…says it's already replicating" out_has "already replicating"
+    zfs create "$SRC/other0"
+    run init "$SRC/other0" "$TARGET"
+    check "init refuses someone else's existing replica" rc_is 1
     check "…and says so"                  out_has "[!] Init failed: $RP already exists"
+    zfs destroy "$SRC/other0"
     zfs create "$SRC/lonely"
     run init "$SRC/lonely" zzunreachable:$DST/bk/lonely
     check "unreachable host: init fails"  rc_is 1
@@ -644,6 +649,96 @@ if [ $SKIP = 0 ]; then
     check "…and the dataset is left consistent" [ "$consistent" = yes ]
     run forget "$R"
     check "forget works once the sync is done" rc_is 0
+fi
+
+T crash_recovery
+if [ $SKIP = 0 ]; then
+    # zz dies abruptly (exit 137, as with kill -9) at each step; the next run, or re-running the
+    # same command, must recover. Dataset K replicates to KR.
+    crash() { local at=$1; shift; OUT=$(ZZTEST_CRASH_AT=$at python3 "$REPO/zz" "$@" 2>&1); RC=$?; }
+    tokens() { zfs get -H -r -o name,value receive_resume_token "$1" | awk -F'\t' '$1 !~ /@/ && $2 != "-"' | grep -c .; }
+    K=$SRC/crash; KR=$DST/bk/crash; zfs create "$K"; zfs create "$K/c"
+    head -c 2M /dev/urandom > "$(mnt "$K")/f"; head -c 2M /dev/urandom > "$(mnt "$K/c")/f"
+
+    # --- init ---
+    crash init:after-snapshot init "$K" "zzremote:$KR" --freq 1h
+    check "init crash after snapshot: exits abruptly" rc_is 137
+    check "…dataset not left half-managed"  [ -z "$(prop target "$K")" ]
+    run init "$K" "zzremote:$KR" --freq 1h
+    check "…re-running init completes"      rc_is 0
+    run forget "$K"; unhold "$KR"; zfs destroy -r "$KR"
+    crash init:after-transfer init "$K" "zzremote:$KR" --freq 1h
+    check "init crash after transfer"       rc_is 137
+    check "…not managed yet"                [ -z "$(prop target "$K")" ]
+    run init "$K" "zzremote:$KR" --freq 1h
+    check "…re-run adopts the finished replica" out_has "already a replica of $K"
+    check "…and completes"                  rc_is 0
+    run forget "$K"; unhold "$KR"; zfs destroy -r "$KR"
+    crash init:mid-finalize init "$K" "zzremote:$KR" --freq 1h
+    check "init crash while writing settings" rc_is 137
+    check "…not managed yet"                [ -z "$(prop target "$K")" ]
+    run init "$K" "zzremote:$KR" --freq 1h
+    check "…re-run completes"               rc_is 0
+    check "…bridge held on both sides"      [ -n "$(held "$K")" ] && [ -n "$(held "$KR")" ]
+
+    # --- sync ---
+    tick; crash sync:after-snapshot sync "$K" --now
+    check "sync crash after snapshot"       rc_is 137
+    run sync "$K"
+    check "…next sync recovers and sends it" rc_is 0
+    check "…replica caught up"              [ "$(newest "$KR")" = "$(newest "$K")" ]
+    tick; crash sync:after-send sync "$K" --now
+    check "sync crash after sending, before bookkeeping" rc_is 137
+    run sync "$K"; run status
+    check "…next sync recovers, status OK"  bash -c "grep -F '$K ' <<<\"\$0\" | grep -qF '| OK '" "$OUT"
+    tick; crash pin:after-hold sync "$K" --now
+    check "crash between holding the new bridge and releasing the old" rc_is 137
+    run sync "$K"
+    check "…next sync leaves exactly one held bridge each side" [ "$(held "$K" | grep -c .)" = 1 ] && [ "$(held "$KR" | grep -c .)" = 1 ]
+
+    # --- an interrupted receive inside a CHILD dataset (the token lands on the child) ---
+    head -c 6M /dev/urandom > "$(mnt "$K/c")/g"; tick
+    zfs snapshot -r "$K@zz_auto_$(date +%s)"; n=$(newest "$K"); b=$(newest "$KR")
+    zfs send -R -L -c -i "@$b" "$K@$n" 2>/dev/null | head -c 3M | zfs recv -s -u "$KR" 2>/dev/null
+    check "setup: token left on the child"  [ "$(tokens "$KR")" -ge 1 ]
+    run sync "$K"
+    check "sync resumes the child's interrupted receive" rc_is 0
+    check "…no tokens left"                 [ "$(tokens "$KR")" = 0 ]
+    check "…child has the snapshot"         exists "$KR/c@$n"
+    head -c 6M /dev/urandom > "$(mnt "$K/c")/h"; tick
+    zfs snapshot -r "$K@zz_auto_$(date +%s)"; n=$(newest "$K"); b=$(newest "$KR")
+    zfs send -R -L -c -i "@$b" "$K@$n" 2>/dev/null | head -c 3M | zfs recv -s -u "$KR" 2>/dev/null
+    run abort "$K"
+    check "abort clears tokens on children too" [ "$(tokens "$KR")" = 0 ]
+    run sync "$K"
+    check "…and sync continues normally"    rc_is 0
+
+    # --- forget ---
+    crash forget:mid-inherit forget "$K"
+    check "forget crash part-way"           rc_is 137
+    check "…dataset still managed (target removed last)" [ -n "$(prop target "$K")" ]
+    run forget "$K"
+    check "…re-running forget completes"    rc_is 0
+    check "…no zz properties or holds left" [ -z "$(zfs get -H -s local -o property all "$K" | grep '^zz:')" ] && [ -z "$(held "$K")" ]
+
+    # --- restore ---
+    run init "$K" "zzremote:$KR" --freq 1h 2>/dev/null
+    good=$(newest "$KR"); tick; echo bad > "$(mnt "$K")/f"; echo bad > "$(mnt "$K/c")/f"; run sync "$K" --now
+    wipe "$K"
+    crash restore:mid-props restore "zzremote:$KR" "$K"
+    check "restore crash while writing settings" rc_is 137
+    run restore "zzremote:$KR" "$K"
+    check "…re-running restore completes (stray settings don't block it)" rc_is 0
+    check "…managed"                        [ "$(prop target "$K")" = "zzremote:$KR" ]
+    wipe "$K"
+    run restore "zzremote:$KR" "$K" --at "$good"
+    crash restore:mid-rollback restore "zzremote:$KR" "$K" --at "$good" --rollback-remote
+    check "restore --rollback-remote crash after the first rollback" rc_is 137
+    run restore "zzremote:$KR" "$K" --at "$good" --rollback-remote
+    check "…re-run completes"               rc_is 0
+    check "…every replica dataset rolled back" [ "$(newest "$KR")" = "$good" ] && [ "$(zfs list -H -t snapshot -o name -s creation -d 1 "$KR/c" | tail -1 | cut -d@ -f2)" = "$good" ]
+    tick; run sync "$K" --now
+    check "…and replication continues"      rc_is 0
 fi
 
 T forget
