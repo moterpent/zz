@@ -13,8 +13,9 @@ import functools
 import shutil
 import threading
 import shlex
+import contextlib
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -148,6 +149,48 @@ def open_lock(name, kind):
     os.makedirs(LOCK_DIR, mode=0o700, exist_ok=True)
     path = os.path.join(LOCK_DIR, f"{name.replace('/', '_')}.{kind}.lock")
     return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), 'r+')
+
+def try_lock(f, wait):
+    """flock f exclusively, retrying for up to `wait` seconds. True if acquired."""
+    deadline = time.monotonic() + wait
+    while True:
+        try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); return True
+        except OSError:
+            if time.monotonic() >= deadline: return False
+            time.sleep(0.2)
+
+class Busy(Exception): pass
+
+@contextlib.contextmanager
+def exclusive(name, wait=5):
+    """Hold both of a dataset's locks (snapshot and transfer), so no sync runs on it meanwhile.
+    Raises Busy rather than waiting out a long transfer."""
+    held = []
+    try:
+        for kind in ("snap", "sync"):
+            f = open_lock(name, kind); held.append(f)
+            if not try_lock(f, wait): raise Busy(name)
+        yield
+    finally:
+        for f in held: f.close()
+
+def locked_on(dataset_of):
+    """Run a command holding the dataset's locks; refuse cleanly if a sync (or another zz
+    command) is working on that dataset. Commands validate the name themselves."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def run(args):
+            name = dataset_of(args)
+            try: check_dataset(name)
+            except ValueError: return fn(args)       # let the command report the bad name
+            try:
+                with exclusive(name): return fn(args)
+            except Busy:
+                print(f"[!] {name}: another zz operation (probably a sync) is running on it. "
+                      f"Try again when it finishes.", flush=True)
+                return True
+        return run
+    return wrap
 
 def managed_dataset(name):
     """ZzDataset for a managed dataset, or None after printing why not."""
@@ -429,6 +472,7 @@ def init_failed(reason, hint=None):
     if hint: print(f"    {hint}", flush=True)
     return True
 
+@locked_on(lambda args: args.dataset)
 def run_init(args):
     try: check_dataset(args.dataset)
     except ValueError as e: return init_failed(str(e))
@@ -521,8 +565,12 @@ def run_sync(args):
         # short lock rather than the transfer lock. Re-read settings once the lock is held,
         # in case another run just took the snapshot.
         with open_lock(name, "snap") as snap_lock:
-            fcntl.flock(snap_lock, fcntl.LOCK_EX)
+            # Another sync only holds this briefly; restore/init/forget/abort hold it throughout
+            if not try_lock(snap_lock, 10):
+                print(f"[*] {name}: another zz operation is running on it. Skipping.", flush=True)
+                continue
             ds = ZzDataset(name)
+            if not ds.props or ds.target == "-": continue    # forgotten while we waited
             now_ts = int(time.time())
             try: freq_sec = ds_duration(ds, "freq", "60m")
             except ValueError as e:
@@ -562,7 +610,7 @@ def run_sync(args):
         try:
             fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print(f"[*] {name}: Local file lock held. Skipping.", flush=True)
+            print(f"[*] {name}: another zz operation is running on it. Skipping.", flush=True)
             lock_f.close(); continue 
 
         # --- PHASE 3: DELTA DISCOVERY ---
@@ -657,6 +705,7 @@ def run_sync(args):
         lock_f.close()
     return failed
 
+@locked_on(lambda args: args.dataset)
 def run_forget(args):
     ds = managed_dataset(args.dataset)
     if not ds: return True
@@ -709,6 +758,7 @@ def resolve_restore_point(at, remote_ds, host):
     print(f"[!] No snapshot at or before {at} on {host}:{remote_ds}; the oldest is @{snaps[-1][1] if snaps else '-'}.", flush=True)
     return None
 
+@locked_on(lambda args: args.local_dataset)
 def run_restore(args):
     try: remote_host, remote_ds = parse_target(args.remote)
     except ValueError as e: print(f"[!] {e}", flush=True); return True
@@ -1065,6 +1115,7 @@ def run_set(args):
         print("    Note: if the next sync fails with a message about flags not matching a previous receive,\n"
               "    set send_flags back to its old value.", flush=True)
 
+@locked_on(lambda args: args.dataset)
 def run_abort(args):
     ds = managed_dataset(args.dataset)
     if not ds: return True

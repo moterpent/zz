@@ -2,6 +2,11 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.7.2] - 2026-09-28
+
+### Fixed
+- `forget` (and `abort`, `restore`, `init`) could run while a sync was transferring the same dataset. A `forget` during a transfer "succeeded", but the finishing sync then wrote `zz:last_sent` and the bridge holds back, leaving a half-forgotten dataset with undeletable snapshots. These commands now hold the dataset's locks: they wait a few seconds for a running sync, then refuse with "another zz operation is running". A sync that finds one of them running skips that dataset instead of queuing behind it.
+
 ## [0.7.1] - 2026-09-28
 
 ### Security
@@ -59,6 +64,7 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.7.2]: https://github.com/moterpent/zz/releases/tag/v0.7.2
 [0.7.1]: https://github.com/moterpent/zz/releases/tag/v0.7.1
 [0.7.0]: https://github.com/moterpent/zz/releases/tag/v0.7.0
 [0.6.0]: https://github.com/moterpent/zz/releases/tag/v0.6.0

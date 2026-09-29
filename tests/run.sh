@@ -39,6 +39,8 @@ cat > "$WORK/bin/ssh" <<'EOF'
 while [[ $# -gt 0 && "$1" == -* ]]; do case "$1" in -o|-p|-i|-l) shift 2 ;; *) shift ;; esac; done
 host=$1; shift
 [ "$host" = zzunreachable ] && { echo "ssh: connect to host zzunreachable: No route to host" >&2; exit 255; }
+# Tests can slow the remote receive down, to have a transfer reliably in progress
+[ -n "${ZZTEST_SLOW_RECV:-}" ] && [[ "$*" == *"zfs recv"* ]] && sleep "$ZZTEST_SLOW_RECV"
 exec bash -c "$*"
 EOF
 chmod +x "$WORK/bin/ssh"
@@ -530,6 +532,58 @@ if [ $SKIP = 0 ]; then
     check "dataset names with spaces rejected clearly" out_has "no spaces"
     check "still nothing ran"               [ ! -e "$WORK/pwned" ]
     zfs destroy -r "$V"
+fi
+
+T locking
+if [ $SKIP = 0 ]; then
+    # A sync holds the dataset's transfer lock for as long as it transfers. Simulate that with
+    # flock(1), which takes the same kind of lock zz does.
+    lockf() { echo "$ZZ_LOCK_DIR/$(echo "$1" | tr / _).sync.lock"; }
+    L=$SRC/lk; zfs create "$L"
+    run init "$L" "zzremote:$DST/bk/lk" --freq 1h
+    check "setup: init succeeds"            rc_is 0
+    mkdir -p "$ZZ_LOCK_DIR"
+    flock "$(lockf "$L")" sleep 20 & holder=$!; sleep 0.5
+    run forget "$L"
+    check "forget refused while a sync holds the dataset" rc_is 1
+    check "…and says why"                   out_has "another zz operation"
+    check "…nothing was forgotten"          [ "$(prop target "$L")" = "zzremote:$DST/bk/lk" ]
+    run abort "$L"
+    check "abort refused while a sync holds the dataset" rc_is 1
+    run sync "$L" --now
+    check "a second sync skips instead of waiting" out_has "another zz operation is running"
+    flock "$(lockf "$SRC/lk2")" sleep 20 & holder2=$!; sleep 0.5
+    zfs create "$SRC/lk2"
+    run init "$SRC/lk2" "zzremote:$DST/bk/lk2"
+    check "init refused while its dataset is locked" rc_is 1
+    zfs destroy "$SRC/lk2"
+    run restore "zzremote:$DST/bk/lk" "$SRC/lk2"
+    check "restore refused while its target is locked" rc_is 1
+    check "…nothing was created"            bash -c "! zfs list '$SRC/lk2' >/dev/null 2>&1"
+    kill $holder $holder2 2>/dev/null; wait $holder $holder2 2>/dev/null
+    run forget "$L"
+    check "forget works once the sync is done" rc_is 0
+
+fi
+
+T forget_during_sync
+if [ $SKIP = 0 ]; then
+    # A forget while a real sync is mid-transfer (the receive is slowed to 8s, longer than the
+    # 5s the lock waits). The dataset must end up consistent: fully forgotten (no zz properties,
+    # no holds) or still fully managed. Before 0.7.2, forget succeeded mid-transfer and the
+    # finishing sync then wrote zz:last_sent and the bridge holds back.
+    R=$SRC/race; zfs create "$R"; head -c 5M /dev/urandom > "$(mnt "$R")/big"
+    run init "$R" "zzremote:$DST/bk/race" --freq 1h
+    check "setup: init succeeds"            rc_is 0
+    tick; ZZTEST_SLOW_RECV=8 zz sync "$R" --now >"$WORK/race.out" 2>&1 & s=$!
+    sleep 1; run forget "$R"; wait $s
+    props=$(zfs get -H -s local -o property all "$R" | grep -c '^zz:'); holds=$(held "$R" | grep -c .)
+    if [ -z "$(prop target "$R")" ]; then consistent=$([ "$props" = 0 ] && [ "$holds" = 0 ] && echo yes); else consistent=yes; fi
+    echo "       (forget during the transfer: exit $RC; afterwards target='$(prop target "$R")', $props zz props, $holds holds)"
+    check "forget during a transfer is refused" rc_is 1
+    check "…and the dataset is left consistent" [ "$consistent" = yes ]
+    run forget "$R"
+    check "forget works once the sync is done" rc_is 0
 fi
 
 T forget
