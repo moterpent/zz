@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.5.3"
+__version__ = "0.6.0"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -298,6 +298,44 @@ def pin_bridge(dataset, bridge, host=None):
         return f"Could not update {HOLD_TAG} hold on {side} {dataset}" + (f": {detail}" if detail else ".")
     return None
 
+def replica_noauto(host, path):
+    """Set canmount=noauto on replica descendants that would auto-mount. The receive-time
+    -o canmount=noauto only reaches the top dataset, and canmount isn't inherited."""
+    try:
+        res = subprocess.check_output(zfs_on(host, "list", "-H", "-o", "name,canmount", "-r", path),
+                                      encoding='utf-8', stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError: return
+    for name, canmount in (l.split('\t') for l in res.splitlines() if l):
+        if name != path and canmount == "on":
+            subprocess.run(zfs_on(host, "set", "canmount=noauto", name), stderr=subprocess.DEVNULL)
+
+def tidy_stale_children(ds, host, rpath):
+    """Children deleted on the primary linger on the replica (zz never receives with -F) and stay
+    recoverable until their snapshots age out; then remove them, so retention decides when
+    deleted data leaves the backup. Records what remains in zz:stale_children. Returns an error
+    message or None."""
+    try:
+        remote = subprocess.check_output(zfs_on(host, "list", "-H", "-o", "name", "-r", rpath),
+                                         encoding='utf-8', stderr=subprocess.DEVNULL).split()
+        local = {n[len(ds.name):] for n in subprocess.check_output(
+            ["zfs", "list", "-H", "-o", "name", "-r", ds.name], encoding='utf-8').split()}
+    except subprocess.CalledProcessError:
+        return f"Could not compare the dataset trees on each side."
+    gone = [r for r in remote if r != rpath and r[len(rpath):] not in local]
+    top = [g for g in gone if not any(g.startswith(o + "/") for o in gone)]
+    remaining, err = [], None
+    for child in top:
+        snaps = subprocess.run(zfs_on(host, "list", "-H", "-t", "snapshot", "-o", "name", "-r", child),
+                               capture_output=True, text=True).stdout.split()
+        if snaps:
+            remaining.append(child[len(rpath) + 1:]); continue
+        print(f"        [-] Removing {child} from the replica: deleted on the primary and aged out of retention", flush=True)
+        if subprocess.run(zfs_on(host, "destroy", "-r", child)).returncode != 0:
+            remaining.append(child[len(rpath) + 1:]); err = f"Could not remove {child} from the replica."
+    val = ",".join(remaining) or "-"
+    if ds.props.get("zz:stale_children", "-") != val: ds.set_prop("stale_children", val)
+    return err
+
 def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
     """Destroy expired zz_auto_ snapshots on one side. Returns True if pruning failed."""
     is_remote = remote_host is not None
@@ -427,6 +465,7 @@ def run_init(args):
         return init_failed("the initial transfer did not complete.",
                            "If it was interrupted, run the same command again to resume it.")
     ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap)
+    replica_noauto(remote_host, remote_path)
     for host, path in ((None, args.dataset), (remote_host, remote_path)):
         err = pin_bridge(path, snap, host)
         if err: print(f"    [!] {err}", flush=True)
@@ -571,6 +610,9 @@ def run_sync(args):
                     break
                 current_base = next_tag
 
+        # New child datasets may have arrived with these sends
+        if current_base != bridge: replica_noauto(remote_host, remote_path)
+
         # Record replication progress; a failure is recorded after, so it isn't cleared
         ds.record_sent(current_base)
         if not send_ok:
@@ -584,6 +626,8 @@ def run_sync(args):
         # Always try to prune after a successful check/sync
         if run_prune(ds, bridge=current_base): failed = True
         if run_prune(ds, remote_host, bridge=current_base, remote_path=remote_path): failed = True
+        err = tidy_stale_children(ds, remote_host, remote_path)
+        if err: ds.record_error(err); failed = True
         
         fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
@@ -640,6 +684,37 @@ def run_restore(args):
     try: rflags = " ".join(parse_send_flags(remote_props.get("zz:send_flags")))
     except ValueError as e: print(f"[!] Remote zz:send_flags: {e}", flush=True); return True
 
+    # The replica tree. Children deleted on the primary stay on the replica (zz never receives
+    # with -F) but lack newer snapshots. ZFS refuses a recursive send unless every dataset in the
+    # tree has the snapshot, even ones excluded with -X, so such children get a temporary
+    # snapshot tagged zz:restore_temp, are excluded, and the temporary snapshot is removed once
+    # the restore completes. The rest of the tree is what the primary looked like at @latest.
+    stale, missing, expected, all_remote = [], [], [remote_ds], set()
+    if not args.latest:
+        try:
+            kids = subprocess.check_output(zfs_on(remote_host, "list", "-H", "-o", "name", "-r", remote_ds),
+                                           encoding='utf-8').split()
+            res = subprocess.check_output(zfs_on(remote_host, "list", "-H", "-t", "snapshot", "-o", "name,zz:restore_temp",
+                                                 "-r", remote_ds), encoding='utf-8')
+        except subprocess.CalledProcessError:
+            print(f"[!] Could not list {remote_ds} and its children on {remote_host}.", flush=True); return True
+        snaps_temp = dict(l.split('\t') for l in res.splitlines() if l)
+        all_remote = {n for n, t in snaps_temp.items() if t != "on"}
+        have = {n.split('@')[0] for n in all_remote if n.endswith(f"@{latest}")}
+        missing = [k for k in kids if k != remote_ds and k not in have]
+        stale = [k for k in missing if not any(k.startswith(m + "/") for m in missing)]  # -X covers descendants
+        expected = [k for k in kids if k not in missing]
+        if stale:
+            print(f"    [!] Not restoring {len(stale)} child dataset(s) that no longer exist on the primary "
+                  f"(no @{latest}): {', '.join(stale)}\n"
+                  f"        They remain on {remote_host} until they age out of retention. To recover files from one,\n"
+                  f"        on {remote_host}: zfs mount <dataset>   (it's read-only; see also its .zfs/snapshot directory)", flush=True)
+            for k in missing:
+                if f"{k}@{latest}" not in snaps_temp:
+                    subprocess.run(zfs_on(remote_host, "snapshot", "-o", "zz:restore_temp=on", f"{k}@{latest}"), check=True)
+    exclude = f"-X {','.join(stale)}" if stale else ""
+    local_name = lambda k: local_ds + k[len(remote_ds):]
+
     # 1. Finish an interrupted receive, if there is one
     try: token = subprocess.check_output(["zfs", "get", "-H", "-o", "value", "receive_resume_token", local_ds],
                                          encoding='utf-8', stderr=subprocess.DEVNULL).strip()
@@ -661,25 +736,55 @@ def run_restore(args):
     else:
         mode = "latest snapshot only" if args.latest else "full history"
         print(f"[*] Restoring @{latest} ({mode})...", flush=True)
-        send = f"zfs send {'-v' if args.latest else '-R -v'} {rflags} {remote_ds}@{latest}"
+        send = f"zfs send {'-v' if args.latest else '-R -v'} {exclude} {rflags} {remote_ds}@{latest}"
         if run_transfer(["ssh", remote_host, send], recv_cmd) != 0:
             print("[!] Restore interrupted. Run the same command to resume.", flush=True); return True
 
-    # 2. A resumed -R stream only completes the snapshot in flight; send whatever is still missing
-    local_snaps = zz_snaps(local_ds)
-    if local_snaps and local_snaps[0] != latest:
-        if local_snaps[0] not in remote_snaps:
-            print(f"[!] Local @{local_snaps[0]} not found on remote; cannot continue.", flush=True); return True
-        # Flags must come before -i/-I, which takes the next argument as its snapshot
-        flags = ("-v" if args.latest else "-R -v") + (f" {rflags}" if rflags else "") + (" -i" if args.latest else " -I")
-        print(f"[*] Catching up @{local_snaps[0]} -> @{latest}...", flush=True)
-        if run_transfer(["ssh", remote_host, f"zfs send {flags} @{local_snaps[0]} {remote_ds}@{latest}"], recv_cmd) != 0:
+    # 2. Bring every dataset in the tree up to @latest. A resumed stream only completes the
+    #    snapshot in flight, and a recursive catch-up fails (or skips) children that don't exist
+    #    here yet. So, parents first: a missing dataset is created with a recursive send of its
+    #    subtree; an existing one that's behind is caught up on its own.
+    for k in expected:
+        lk = local_name(k)
+        try: have_local = zz_snaps(lk)
+        except subprocess.CalledProcessError: have_local = None     # not here yet
+        if have_local and have_local[0] == latest: continue
+        sub_ex = [x for x in stale if x.startswith(k + "/")]
+        ex = f"-X {','.join(sub_ex)}" if sub_ex else ""
+        base = "-v" if args.latest else f"-R -v {ex}"   # recursive, for creating a missing subtree
+        if not have_local:
+            if have_local is not None:   # exists but has no zz snapshots: not something zz restored
+                print(f"[!] {lk} exists but has no zz snapshots; move it aside and run restore again.", flush=True); return True
+            print(f"[*] Restoring missing {lk}...", flush=True)
+            send = f"zfs send {base} {rflags} {k}@{latest}"
+        else:
+            if not args.latest and f"{k}@{have_local[0]}" not in all_remote and k != remote_ds:
+                print(f"[!] {lk}@{have_local[0]} not found on the remote; cannot continue.", flush=True); return True
+            if k == remote_ds and have_local[0] not in remote_snaps:
+                print(f"[!] Local @{have_local[0]} not found on remote; cannot continue.", flush=True); return True
+            # Flags must come before -i/-I, which takes the next argument as its snapshot
+            print(f"[*] Catching up {lk} @{have_local[0]} -> @{latest}...", flush=True)
+            send = f"zfs send -v {rflags} {'-i' if args.latest else '-I'} @{have_local[0]} {k}@{latest}"
+        if run_transfer(["ssh", remote_host, send], ["zfs", "recv", "-s", "-u", lk]) != 0:
             print("[!] Restore interrupted. Run the same command to resume.", flush=True); return True
-    if not zz_snaps(local_ds) or zz_snaps(local_ds)[0] != latest:
-        print(f"[!] Restore incomplete: @{latest} not present locally.", flush=True); return True
+    behind = []
+    for k in expected:
+        try:
+            if zz_snaps(local_name(k))[:1] != [latest]: behind.append(local_name(k))
+        except subprocess.CalledProcessError: behind.append(local_name(k))
+    if behind:
+        print(f"[!] Restore incomplete: not at @{latest}: {', '.join(behind)}. Run the same command again.", flush=True)
+        return True
+
+    # Remove the temporary snapshots from stale children (before holds are placed on @latest)
+    for k in missing:
+        subprocess.run(zfs_on(remote_host, "destroy", f"{k}@{latest}"), stderr=subprocess.DEVNULL)
 
     # 3. Make it a live, managed primary again (unless another dataset already replicates there)
-    subprocess.run(["zfs", "set", "readonly=off", local_ds]); subprocess.run(["zfs", "set", "canmount=on", local_ds])
+    subprocess.run(["zfs", "set", "readonly=off", local_ds])
+    res = subprocess.check_output(["zfs", "list", "-H", "-o", "name,canmount", "-r", local_ds], encoding='utf-8')
+    for n, canmount in (l.split('\t') for l in res.splitlines() if l):
+        if n == local_ds or canmount == "noauto": subprocess.run(["zfs", "set", "canmount=on", n])
     owners = [n for n in (get_managed_datasets() or []) if n != local_ds and ZzDataset(n).target == args.remote]
     if not owners:
         ds = ZzDataset(local_ds)
@@ -748,6 +853,10 @@ def print_status_table(names):
             when = datetime.datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S') if ts.isdigit() else "?"
             errors.append(f"  {name} @ {when}: {msg}")
     if errors: print("\nLast errors:\n" + "\n".join(errors), flush=True)
+    notes = [(n, ZzDataset(n).props.get("zz:stale_children", "-")) for n in names]
+    notes = [f"  {n}: the replica still has {v.replace(',', ', ')} (deleted here); recoverable there until it ages out"
+             for n, v in notes if v != "-"]
+    if notes: print("\nNotes:\n" + "\n".join(notes), flush=True)
     return unhealthy
 
 def run_status(args):
@@ -831,6 +940,10 @@ def run_snaps(args):
         held_str = f"{human_bytes(held)} held by snapshots" if held is not None else "snapshot space unknown"
         return f"{label:<7} {len(rows)} snapshots, {held_str}, oldest {oldest}"
     print("\n" + summary("LOCAL", local, local_held), flush=True)
+    stale = ds.props.get("zz:stale_children", "-")
+    if stale != "-":
+        print(f"NOTE    the replica still has child dataset(s) deleted here: {stale.replace(',', ', ')}; "
+              f"recoverable there until they age out of retention", flush=True)
     if remote_ok: print(summary("REMOTE", remote, remote_held), flush=True)
     else:
         print(f"REMOTE  [!] could not list snapshots on {remote_host}:{remote_path}; showing local side only", flush=True)

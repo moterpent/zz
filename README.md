@@ -54,7 +54,7 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```
 Each run logs a header with the version and time, then a line when each send starts and one when it finishes:
 ```
---- zz 0.5.3 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
+--- zz 0.6.0 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
 [*] tank/data: Taking scheduled snapshot @zz_auto_1790630101...
     [>] Sending tank/data @zz_auto_1790626501 -> @zz_auto_1790630101...
     [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
@@ -128,6 +128,7 @@ zz restore backup-server:pool/data tank/data
 * Restores the newest `zz_auto_` snapshot with its full history (`--latest` for just that snapshot), mounts it, and makes it the managed primary again; the next `zz sync` resumes replication incrementally.
 * If a restore is interrupted, run the same command again to resume it.
 * Refuses to overwrite an existing dataset. Restoring to a different name while the original still replicates to that remote leaves the copy unmanaged.
+* Child datasets are restored with it, and the whole tree is verified before the restore reports success. Children that had been deleted on the primary are left out (see Deleted Child Datasets below), and restore says where to find them.
 
 ### 5. Stop Tracking (Forget)
 Remove zz management but keep your data.
@@ -180,7 +181,7 @@ Every push runs two suites on GitHub Actions:
   ```bash
   python3 tests/test_units.py
   ```
-* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, send flags (compressed, large-block, encrypted raw, and pre-0.5 replications), concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
+* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, send flags (compressed, large-block, encrypted raw, and pre-0.5 replications), child datasets (created, deleted, aged out, restored), concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
   ```bash
   sudo tests/run.sh             # everything (about 2 minutes)
   sudo tests/run.sh restore     # only tests whose name contains "restore"
@@ -190,7 +191,7 @@ Every push runs two suites on GitHub Actions:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.5.3 (009090e)
+zz 0.6.0 (06a5c6f)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
@@ -210,6 +211,7 @@ Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`
 |zz:last_sync  |Time of last scheduled snapshot; the schedule counts from it (managed by zz)|-|1790626501|
 |zz:last_sent  |Time of newest snapshot confirmed on remote (managed by zz)|-|1790626501|
 |zz:last_error |Last sync failure, cleared on success (managed by zz)|-|1790626501 Could not retrieve...|
+|zz:stale_children|Child datasets deleted here but still on the replica (managed by zz)|-|projects,archive|
 
 
 ## ⚠️ Important Notes
@@ -228,6 +230,7 @@ hand on the backup host: `zfs set readonly=on canmount=noauto pool/data`. If it 
   * **Encrypted datasets: `-w` (raw).** Data is sent still encrypted. The backup host never has the key, so it can be an untrusted machine. After a `zz restore` of an encrypted dataset, load the key (`zfs load-key pool/data`) and mount it; zz prints the exact commands. A raw receive resets `keylocation` to `prompt`, so set it again if the key should load at boot.
   * **Replications set up before zz 0.5 have no send flags** and keep sending exactly as before. To opt in: `zz set pool/data send_flags -L -c`. In testing, switching an existing unencrypted replication this way worked on the next sync; if a sync fails with a message about flags not matching a previous receive, set it back with `zz set pool/data send_flags none`. Don't switch an unencrypted replication to `-w` or vice versa.
   * To choose flags yourself at init: `zz init ... --send-flags=-L` (use `=`, since the value starts with a dash), or `--send-flags=none`.
+* **Deleted Child Datasets:** Replication includes child datasets (`tank/data/projects`, ...). If you delete a child on the primary, the replica keeps its copy, since zz never receives with `-F`, and it stays **recoverable there until its snapshots age out of `keep_remote`**. The same retention window applies as for any deleted file. While it's there, `zz status` and `zz snaps` note it. To recover files, on the backup host: `zfs mount pool/data/projects` (read-only; older versions are under `.zfs/snapshot/`). Once all of its snapshots have aged out, the next sync removes it from the replica. A full `zz restore` rebuilds the tree as the primary last was, leaving such children out.
 * **Lock Files:** Stored in `/run/zz/` (root-only; override with `ZZ_LOCK_DIR`). A short lock serializes snapshotting, and a second lock prevents overlapping transfers, so snapshots are still taken on schedule while a long transfer runs.
 * **Schedule Drift:** A snapshot is taken when at least `freq` minus 30 seconds has
 passed since the last one. Without that allowance, a cron run a second early would

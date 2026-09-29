@@ -377,6 +377,88 @@ if [ $SKIP = 0 ]; then
     check "…replica still never had the key" [ "$(val keystatus "$ER")" = unavailable ]
 fi
 
+T child_datasets
+if [ $SKIP = 0 ]; then
+    F=$SRC/fam; FR=$DST/bk/fam
+    zfs create "$F"; for c in a a/x b d; do zfs create "$F/$c"; done
+    for d in "$F" "$F/a" "$F/a/x" "$F/b" "$F/d"; do head -c 2M /dev/urandom > "$(mnt "$d")/data"; done
+    run init "$F" "zzremote:$FR" --freq 1h --keep-local 1m --keep-remote 1m --keep-min 1
+    check "init of a dataset tree succeeds" rc_is 0
+    check "whole tree arrives on the replica" bash -c "for c in a a/x b d; do zfs list -H -o name '$FR/'\$c >/dev/null || exit 1; done"
+    check "children have the same snapshot" exists "$FR/a/x@$(newest "$F")"
+    check "replica children are read-only"  [ "$(val readonly "$FR/a/x")" = on ]
+    check "replica children won't auto-mount" bash -c "for c in a a/x b d; do [ \$(zfs get -H -o value canmount '$FR/'\$c) = noauto ] || exit 1; done"
+    b1=$(newest "$F")
+    check "bridge hold covers children (local)"  bash -c "zfs holds -H '$F/a/x@$b1' | grep -q zz_bridge"
+    check "bridge hold covers children (remote)" bash -c "zfs holds -H '$FR/a/x@$b1' | grep -q zz_bridge"
+
+    # changes in a child, plus a child created after init
+    head -c 1M /dev/urandom > "$(mnt "$F/a/x")/more"; zfs create "$F/c"; head -c 1M /dev/urandom > "$(mnt "$F/c")/data"; tick
+    run sync "$F" --now
+    check "sync of the tree succeeds"       rc_is 0
+    check "child's new snapshot replicated" exists "$FR/a/x@$(newest "$F")"
+    check "child created after init is picked up" exists "$FR/c@$(newest "$F")"
+    check "…and won't auto-mount on the replica" [ "$(val canmount "$FR/c")" = noauto ]
+    check "bridge hold moved on the children too" bash -c "zfs holds -H '$FR/a/x@$(newest "$F")' | grep -q zz_bridge && ! zfs holds -H '$FR/a/x@$b1' 2>/dev/null | grep -q zz_bridge"
+
+    # a child deleted on the source: kept on the replica, noted, then removed once aged out
+    unhold "$F"; zfs destroy -r "$F/b"; tick
+    run sync "$F" --now
+    check "sync still works after a child is deleted" rc_is 0
+    check "…replica keeps the deleted child (zz never uses recv -F)" exists "$FR/b"
+    check "…and records it"                 [ "$(prop stale_children "$F")" = b ]
+    run status
+    check "status notes the deleted child"  out_has "the replica still has b (deleted here)"
+    run snaps "$F"
+    check "snaps notes it too"              out_has "deleted here: b"
+    echo "       (waiting 65s so older snapshots pass the 1m retention)"
+    sleep 65; tick; run sync "$F" --now
+    check "pruning succeeds on the tree"    rc_is 0
+    for side in "$F" "$FR"; do
+        check "children pruned in step with the parent ($side)" bash -c "
+            p=\$(zfs list -H -t snapshot -o name -d 1 '$side' | cut -d@ -f2 | sort)
+            c=\$(zfs list -H -t snapshot -o name -d 1 '$side/a/x' | cut -d@ -f2 | sort)
+            [ \"\$p\" = \"\$c\" ]"
+    done
+    check "aged-out deleted child removed from the replica" bash -c "! zfs list '$FR/b' >/dev/null 2>&1"
+    check "…says so"                        out_has "Removing $FR/b from the replica"
+    check "…and is no longer recorded"      [ "$(prop stale_children "$F")" = "-" ]
+
+    # a child deleted recently (still within retention on the replica), then the primary is lost
+    unhold "$F"; zfs destroy -r "$F/d"; tick; run sync "$F" --now
+    check "recently deleted child still on the replica" exists "$FR/d"
+    dsnaps=$(zfs list -H -t snapshot -o name -r "$FR/d" | sort)
+    for d in "$F" "$F/a" "$F/a/x" "$F/c"; do
+        (cd "$(mnt "$d")" && find . -maxdepth 1 -type f -exec sha256sum {} +) > "$WORK/sums_$(echo "$d" | tr / _)"
+    done
+    tree_ok() {   # every restored dataset present, data intact, mounted, writable, mounts at boot
+        local ok=1; for d in "$F" "$F/a" "$F/a/x" "$F/c"; do
+            exists "$d" || { ok=0; continue; }
+            (cd "$(mnt "$d")" && sha256sum -c --quiet "$WORK/sums_$(echo "$d" | tr / _)") >/dev/null 2>&1 || ok=0
+            [ "$(val mounted "$d")" = yes ] && [ "$(val canmount "$d")" = on ] || ok=0
+            touch "$(mnt "$d")/writable" 2>/dev/null || ok=0
+        done; [ $ok = 1 ]; }
+    wipe "$F"
+    run restore "zzremote:$FR" "$F"
+    check "restore of the tree succeeds"    rc_is 0
+    check "…leaves out the deleted child, and says how to recover it" out_has "Not restoring 1 child dataset(s)"
+    check "deleted child not resurrected"   bash -c "! zfs list '$F/d' >/dev/null 2>&1"
+    check "every restored dataset intact, mounted, writable, mounts at boot" tree_ok
+    check "replica's copy of the deleted child untouched" [ "$(zfs list -H -t snapshot -o name -r "$FR/d" | sort)" = "$dsnaps" ]
+    check "no temporary restore snapshots left behind" bash -c "! zfs list -H -t snapshot -o zz:restore_temp -r '$FR' | grep -q on"
+    tick; run sync "$F" --now
+    check "sync after restoring the tree"   rc_is 0
+
+    # resumed restore where the top dataset arrived but the children didn't
+    wipe "$F"
+    oldest=$(zfs list -H -t snapshot -o name -s creation -d 1 "$FR" | grep '@zz_auto_' | head -1)
+    zfs send -L -c "$oldest" | zfs recv -u "$F"
+    run restore "zzremote:$FR" "$F"
+    check "resumed tree restore succeeds"   rc_is 0
+    check "…fills in the children that hadn't arrived" out_has "Restoring missing $F/a"
+    check "…whole tree intact"              tree_ok
+fi
+
 T forget
 if [ $SKIP = 0 ]; then
     run forget "$DS"
