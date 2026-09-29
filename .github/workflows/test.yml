@@ -11,8 +11,8 @@ jobs:
       matrix:
         python: ["3.9", "3.12"]   # 3.9 is Rocky/RHEL 9's system Python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - run: python3 tests/test_units.py
@@ -20,12 +20,18 @@ jobs:
   zfs:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install ZFS
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zfsutils-linux
-          sudo modprobe zfs || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe zfs; }
+          set -x
+          uname -r
+          # Retry apt: mirror hiccups shouldn't fail the build
+          for i in 1 2 3; do sudo apt-get update && sudo apt-get install -y zfsutils-linux && break; sleep 15; done
+          # The runner kernel normally ships the zfs module; if it doesn't, try the
+          # extra-modules package, then fall back to building it with DKMS (slower)
+          sudo modprobe zfs \
+            || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe zfs; } \
+            || { sudo apt-get install -y "linux-headers-$(uname -r)" zfs-dkms && sudo modprobe zfs; }
           zfs version
       - name: Integration tests (real ZFS, throwaway pools)
         run: sudo tests/run.sh

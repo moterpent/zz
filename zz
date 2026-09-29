@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -516,6 +516,8 @@ def run_sync(args):
             print(f"[*] {name}: Remote is already up to date.", flush=True)
         else:
             for next_tag in pending:
+                # Announce the send before it starts, so a long transfer doesn't look like a hang
+                print(f"    [>] Sending {name} @{current_base} -> @{next_tag}...", flush=True)
                 send_cmd = ["zfs", "send", "-R"] + send_flags + ["-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
                 if run_transfer(send_cmd, recv_cmd, summary=f"{name} @{current_base} -> @{next_tag}") != 0:
                     send_ok = False

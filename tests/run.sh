@@ -124,7 +124,9 @@ if [ $SKIP = 0 ]; then
     write f2 20M; tick
     run sync "$DS" --now
     check "sync succeeds"                 rc_is 0
+    check "send announced when it starts" out_has "[>] Sending $DS @"
     check "one-line send summary"         out_has "[+] Sent $DS @"
+    check "…announcement comes first"     [ "$(grep -n '\[>\] Sending' <<<"$OUT" | cut -d: -f1)" -lt "$(grep -n '\[+\] Sent' <<<"$OUT" | cut -d: -f1)" ]
     check "no zfs -v progress lines"      out_lacks "estimated size"
     check "replica caught up"             [ "$(newest "$RP")" = "$(newest "$DS")" ]
     run status
