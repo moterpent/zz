@@ -37,7 +37,8 @@ cat > "$WORK/bin/ssh" <<'EOF'
 #!/bin/bash
 # Stand-in for ssh: drop options and the host, run the command locally.
 while [[ $# -gt 0 && "$1" == -* ]]; do case "$1" in -o|-p|-i|-l) shift 2 ;; *) shift ;; esac; done
-shift  # host
+host=$1; shift
+[ "$host" = zzunreachable ] && { echo "ssh: connect to host zzunreachable: No route to host" >&2; exit 255; }
 exec bash -c "$*"
 EOF
 chmod +x "$WORK/bin/ssh"
@@ -100,6 +101,14 @@ if [ $SKIP = 0 ] || true; then   # always runs: everything depends on it
     zfs create "$DS"; write f1 40M
     run init "$DS" "$TARGET" --freq 1h --keep-local 1m --keep-min 1
     check "init succeeds"                 rc_is 0
+    check "…says so, with source and target" out_has "[+] Init successful: $DS -> $TARGET"
+    check "…shows the new dataset's status row" bash -c "grep -F '$DS ' <<<\"\$0\" | grep -qF '| OK '" "$OUT"
+    check "…lists next steps"             out_has "Next steps:"
+    if crontab -l 2>/dev/null | grep -Eq '(^|[[:space:]/])zz[[:space:]]+sync'; then
+        check "…no cron hint (already scheduled)" out_lacks "no cron entry"
+    else
+        check "…reminds to schedule syncs"  out_has "no cron entry running 'zz sync' was found"
+    fi
     check "remote parent created"         exists "$DST/bk"
     check "data landed at exact path"     [ "$(nsnaps "$RP")" = 1 ]
     check "last_sent recorded"            [ -n "$(prop last_sent)" ]
@@ -108,7 +117,13 @@ if [ $SKIP = 0 ] || true; then   # always runs: everything depends on it
     check "replica is read-only"          [ "$(val readonly "$RP")" = on ]
     run init "$DS" "$TARGET"
     check "second init refuses existing remote"   rc_is 1
-    check "…and says so"                  out_has "already exists"
+    check "…and says so"                  out_has "[!] Init failed: $RP already exists"
+    zfs create "$SRC/lonely"
+    run init "$SRC/lonely" zzunreachable:$DST/bk/lonely
+    check "unreachable host: init fails"  rc_is 1
+    check "…says it couldn't connect"     out_has "could not reach zzunreachable over ssh"
+    check "…nothing marked as managed"    [ -z "$(prop target "$SRC/lonely")" ]
+    zfs destroy "$SRC/lonely"
 fi
 
 T validation

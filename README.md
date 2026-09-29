@@ -45,6 +45,7 @@ To start backing up a dataset, use `init`. This performs the initial full transf
 ```bash
 zz init tank/data backup-server:pool/data --freq 5m --keep-local 1h --keep-remote 7d
 ```
+When it finishes, `init` prints a clear success or failure line, the new dataset's status row, and next steps, including a reminder to schedule `zz sync` if no cron entry for it is found. If the initial transfer is interrupted, run the same command again to resume it.
 
 ### 2. Automate with Cron
 Add zz sync to your crontab. It handles its own locking and timing checks.
@@ -53,7 +54,7 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```
 Each run logs a header with the version and time, then a line when each send starts and one when it finishes:
 ```
---- zz 0.5.1 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
+--- zz 0.5.3 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
 [*] tank/data: Taking scheduled snapshot @zz_auto_1790630101...
     [>] Sending tank/data @zz_auto_1790626501 -> @zz_auto_1790630101...
     [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
@@ -189,7 +190,7 @@ Every push runs two suites on GitHub Actions:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.5.1 (b52dbfe)
+zz 0.5.3 (009090e)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 

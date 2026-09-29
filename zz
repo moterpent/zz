@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -344,33 +344,71 @@ def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
         ds.record_error(f"Could not destroy {len(failed)} {label} snapshot(s), e.g. {failed[0]}."); return True
     return False
 
+def sync_scheduled():
+    """True if root's crontab, /etc/crontab or /etc/cron.d mentions 'zz ... sync'."""
+    pattern = re.compile(r'(^|[\s/])zz\s+sync\b')
+    texts = [subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout]
+    for path in ["/etc/crontab"] + [os.path.join("/etc/cron.d", f) for f in (os.listdir("/etc/cron.d") if os.path.isdir("/etc/cron.d") else [])]:
+        try:
+            with open(path) as f: texts.append(f.read())
+        except OSError: pass
+    return any(pattern.search(line) for t in texts for line in t.splitlines() if not line.lstrip().startswith("#"))
+
+def init_done(dataset, target):
+    """Success summary: this dataset's status row and what to do next."""
+    print(f"\n[+] Init successful: {dataset} -> {target}\n", flush=True)
+    print_status_table([dataset])
+    print("\nNext steps:", flush=True)
+    if not sync_scheduled():
+        print("  * Schedule syncs; no cron entry running 'zz sync' was found. For example, in root's crontab:\n"
+              "      */5 * * * * /usr/local/bin/zz sync >> /var/log/zz.out 2>&1", flush=True)
+    print("  * Check on it any time with: zz status   (or: zz snaps)", flush=True)
+
+def init_failed(reason, hint=None):
+    print(f"\n[!] Init failed: {reason}", flush=True)
+    if hint: print(f"    {hint}", flush=True)
+    return True
+
 def run_init(args):
     ds = ZzDataset(args.dataset)
-    if ds.props is None:
-        print(f"[!] Error: Dataset '{args.dataset}' not found.", flush=True); return True
+    if ds.props is None: return init_failed(f"dataset '{args.dataset}' not found.")
     try: remote_host, remote_path = parse_target(args.remote)
-    except ValueError as e: print(f"[!] {e}", flush=True); return True
+    except ValueError as e: return init_failed(str(e))
     recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {REPLICA_RECV_OPTS} {remote_path}"]
 
     if is_busy_local(args.dataset) or is_token_active(remote_host, remote_path):
-        print(f"[*] {args.dataset}: Transfer already active. Skipping.", flush=True); return
+        return init_failed(f"a transfer for {args.dataset} is already running.", "Wait for it to finish, then run init again.")
 
     token = get_token(remote_host, remote_path)
     if token != "-":
         print(f"[*] Resuming initial sync...", flush=True)
         send_cmd = ["zfs", "send", "-v", "-t", token]
-        if run_transfer(send_cmd, recv_cmd) == 0:
-            ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq); ds.set_prop("last_sync", int(time.time()))
-            print("[+] Resume successful. Init complete.", flush=True)
-            return
-        print("[!] Transfer interrupted. Run again to resume.", flush=True); return True
+        if run_transfer(send_cmd, recv_cmd) != 0:
+            return init_failed("the initial transfer was interrupted again.", "Run the same command again to resume it.")
+        ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq); ds.set_prop("last_sync", int(time.time()))
+        try: snaps = zz_snaps(remote_path, remote_host)
+        except subprocess.CalledProcessError: snaps = []
+        if snaps:
+            ds.record_sent(snaps[0])
+            for host, path in ((None, args.dataset), (remote_host, remote_path)):
+                err = pin_bridge(path, snaps[0], host)
+                if err: print(f"    [!] {err}", flush=True)
+        init_done(args.dataset, args.remote)
+        return
 
-    if subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -H -o name {remote_path}"],
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        print(f"[!] {remote_path} already exists on {remote_host}. Refusing to overwrite it.", flush=True); return True
+    probe = subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -H -o name {remote_path}"],
+                           capture_output=True, text=True)
+    if probe.returncode == 0:
+        return init_failed(f"{remote_path} already exists on {remote_host}; refusing to overwrite it.",
+                           "Choose a different remote path, or remove the existing one first.")
+    if probe.returncode == 255:   # ssh's own failure code
+        return init_failed(f"could not reach {remote_host} over ssh.",
+                           f"Check with: ssh {remote_host} zfs list   (key-based login is required)")
     parent = remote_path.rsplit('/', 1)[0]
     if '/' in parent:
-        subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs create -p {parent}"], check=True)
+        mk = subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs create -p {parent}"], capture_output=True, text=True)
+        if mk.returncode != 0:
+            return init_failed(f"could not create {parent} on {remote_host}: {mk.stderr.strip()}")
 
     ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq)
     ds.set_prop("keep_local", args.keep_local); ds.set_prop("keep_remote", args.keep_remote); ds.set_prop("keep_min", args.keep_min)
@@ -378,19 +416,21 @@ def run_init(args):
     ds.set_prop("send_flags", flags or "none")
     snap = f"zz_auto_{int(time.time())}"
     print(f"[*] Creating initial snapshot: {args.dataset}@{snap}", flush=True)
-    subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], check=True)
+    mk = subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], capture_output=True, text=True)
+    if mk.returncode != 0:
+        return init_failed(f"could not create the initial snapshot: {mk.stderr.strip()}")
 
     print(f"[*] Starting initial transfer (Resumable)...", flush=True)
     print(f"    send flags: {flags or 'none'}", flush=True)
     send_cmd = ["zfs", "send", "-R", "-v"] + parse_send_flags(flags) + [f"{args.dataset}@{snap}"]
-    if run_transfer(send_cmd, recv_cmd) == 0:
-        ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap)
-        for host, path in ((None, args.dataset), (remote_host, remote_path)):
-            err = pin_bridge(path, snap, host)
-            if err: print(f"    [!] {err}", flush=True)
-        print("[+] Init successful.", flush=True)
-    else:
-        print("[!] Transfer interrupted. Run again to resume.", flush=True); return True
+    if run_transfer(send_cmd, recv_cmd) != 0:
+        return init_failed("the initial transfer did not complete.",
+                           "If it was interrupted, run the same command again to resume it.")
+    ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap)
+    for host, path in ((None, args.dataset), (remote_host, remote_path)):
+        err = pin_bridge(path, snap, host)
+        if err: print(f"    [!] {err}", flush=True)
+    init_done(args.dataset, args.remote)
 
 def run_sync(args):
     print(f"--- zz {get_version()} sync @ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---", flush=True)
@@ -680,16 +720,13 @@ def replication_state(ds, now):
     if lag > 2 * freq_sec + 300: return "LAGGING", lag
     return "OK", lag
 
-def run_status(args):
-    print(f"zz {get_version()}\n", flush=True)
-    managed = get_managed_datasets()
-    if managed is None: return True
-    if not managed: print("No managed datasets.", flush=True); return
+def print_status_table(names):
+    """Status rows for these datasets, then any errors. Returns True if any is unhealthy."""
     print(f"{'DATASET':<20} | {'STATUS':<8} | {'LAST SNAP':<18} | {'LAG':<16} | {'NEXT SNAP'}", flush=True)
     print("-" * 90, flush=True)
     unhealthy, errors = False, []
     now = int(time.time())
-    for name in managed:
+    for name in names:
         ds = ZzDataset(name)
         status, lag = replication_state(ds, now)
         lag_str = fmt_age(lag) if lag is not None else "-"
@@ -712,6 +749,13 @@ def run_status(args):
             errors.append(f"  {name} @ {when}: {msg}")
     if errors: print("\nLast errors:\n" + "\n".join(errors), flush=True)
     return unhealthy
+
+def run_status(args):
+    print(f"zz {get_version()}\n", flush=True)
+    managed = get_managed_datasets()
+    if managed is None: return True
+    if not managed: print("No managed datasets.", flush=True); return
+    return print_status_table(managed)
 
 def snap_table(dataset, host=None):
     """{tag: (creation, used, written)} for zz_auto_ snapshots of exactly this dataset, plus
