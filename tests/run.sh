@@ -187,6 +187,8 @@ if [ $SKIP = 0 ]; then
     check "--force still works"           out_has "on-demand"
     n=$(nsnaps "$DS"); run sync "$DS"
     check "plain sync takes nothing when not due" [ "$(nsnaps "$DS")" = "$n" ]
+    check "…and says when the next one is"  out_has "Next snapshot in"
+    check "…and how to force one"         out_has "use --now"
 fi
 
 T concurrent_snapshot

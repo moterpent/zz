@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -427,7 +427,8 @@ def run_sync(args):
 
             # The 30s allowance keeps a snapshot due on this cron run from slipping to the next.
             due = (now_ts - ds.last_sync) >= (freq_sec - 30)
-            if due or args.force:
+            snapped = due or args.force
+            if snapped:
                 new_snap_tag = f"zz_auto_{now_ts}"
                 kind = "scheduled" if due else "on-demand (--now)"
                 print(f"[*] {name}: Taking {kind} snapshot @{new_snap_tag}...", flush=True)
@@ -513,7 +514,13 @@ def run_sync(args):
         current_base = bridge
         send_ok = True
         if not pending:
-            print(f"[*] {name}: Remote is already up to date.", flush=True)
+            if snapped:
+                print(f"[*] {name}: Remote is already up to date.", flush=True)
+            else:
+                # Nothing was due, so changes since the last snapshot haven't been captured yet
+                next_in = fmt_age(max(0, ds.last_sync + freq_sec - int(time.time())))
+                print(f"[*] {name}: Remote is up to date. Next snapshot in {next_in} "
+                      f"(use --now to snapshot immediately).", flush=True)
         else:
             for next_tag in pending:
                 # Announce the send before it starts, so a long transfer doesn't look like a hang
