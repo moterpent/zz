@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -50,6 +50,31 @@ def ds_duration(ds, prop, default):
     """Parsed zz:<prop> of a dataset; ValueError names the property if it is invalid."""
     try: return parse_duration(ds.props.get(f"zz:{prop}", default))
     except ValueError as e: raise ValueError(f"zz:{prop}: {e}")
+
+# zfs send flags zz may use; chosen once at init and stored in zz:send_flags, because
+# changing them mid-replication can make incremental receives fail.
+SEND_FLAGS = ("-L", "-c", "-e", "-w")
+# Received on the replica by init: don't auto-mount at the primary's mountpoint, don't allow writes
+REPLICA_RECV_OPTS = "-o canmount=noauto -o readonly=on"
+
+def parse_send_flags(val):
+    """zz:send_flags value -> list of zfs send flags. Absent/'none' means none (pre-0.5 replications)."""
+    if val is None or str(val).strip() in ("", "none", "-"): return []
+    flags = str(val).split()
+    bad = [f for f in flags if f not in SEND_FLAGS]
+    if bad: raise ValueError(f"invalid send flags {' '.join(bad)} (allowed: {' '.join(SEND_FLAGS)}, or none)")
+    return flags
+
+def default_send_flags(dataset):
+    """-w (raw) for encrypted datasets, so the replica never needs the key; otherwise -L -c.
+    -e is left out: its streams can't be received into an encrypted dataset on the replica."""
+    enc = subprocess.run(["zfs", "get", "-H", "-o", "value", "encryption", dataset],
+                         capture_output=True, text=True).stdout.strip()
+    return "-w" if enc not in ("", "off", "-") else "-L -c"
+
+def send_flags_arg(val):
+    try: return " ".join(parse_send_flags(val))
+    except ValueError as e: raise argparse.ArgumentTypeError(str(e))
 
 def keep_min_arg(val):
     if not str(val).isdigit(): raise argparse.ArgumentTypeError(f"invalid keep_min '{val}' (use a whole number, 0 or more)")
@@ -325,7 +350,7 @@ def run_init(args):
         print(f"[!] Error: Dataset '{args.dataset}' not found.", flush=True); return True
     try: remote_host, remote_path = parse_target(args.remote)
     except ValueError as e: print(f"[!] {e}", flush=True); return True
-    recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {remote_path}"]
+    recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {REPLICA_RECV_OPTS} {remote_path}"]
 
     if is_busy_local(args.dataset) or is_token_active(remote_host, remote_path):
         print(f"[*] {args.dataset}: Transfer already active. Skipping.", flush=True); return
@@ -349,12 +374,15 @@ def run_init(args):
 
     ds.set_prop("target", args.remote); ds.set_prop("freq", args.freq)
     ds.set_prop("keep_local", args.keep_local); ds.set_prop("keep_remote", args.keep_remote); ds.set_prop("keep_min", args.keep_min)
+    flags = args.send_flags if args.send_flags is not None else default_send_flags(args.dataset)
+    ds.set_prop("send_flags", flags or "none")
     snap = f"zz_auto_{int(time.time())}"
     print(f"[*] Creating initial snapshot: {args.dataset}@{snap}", flush=True)
     subprocess.run(["zfs", "snapshot", "-r", f"{args.dataset}@{snap}"], check=True)
 
     print(f"[*] Starting initial transfer (Resumable)...", flush=True)
-    send_cmd = ["zfs", "send", "-R", "-v", f"{args.dataset}@{snap}"]
+    print(f"    send flags: {flags or 'none'}", flush=True)
+    send_cmd = ["zfs", "send", "-R", "-v"] + parse_send_flags(flags) + [f"{args.dataset}@{snap}"]
     if run_transfer(send_cmd, recv_cmd) == 0:
         ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap)
         for host, path in ((None, args.dataset), (remote_host, remote_path)):
@@ -381,6 +409,9 @@ def run_sync(args):
         except ValueError as e:
             ds.record_error(str(e)); failed = True; continue
         recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {remote_path}"]
+        try: send_flags = parse_send_flags(ds.props.get("zz:send_flags"))
+        except ValueError as e:
+            ds.record_error(f"zz:send_flags: {e}"); failed = True; continue
 
         # --- PHASE 1: THE SNAPSHOT (CATCH-UP LOGIC) ---
         # Taken even while a transfer is running (it is sent later), so this uses its own
@@ -485,7 +516,7 @@ def run_sync(args):
             print(f"[*] {name}: Remote is already up to date.", flush=True)
         else:
             for next_tag in pending:
-                send_cmd = ["zfs", "send", "-R", "-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
+                send_cmd = ["zfs", "send", "-R"] + send_flags + ["-i", f"@{current_base}", f"{ds.name}@{next_tag}"]
                 if run_transfer(send_cmd, recv_cmd, summary=f"{name} @{current_base} -> @{next_tag}") != 0:
                     send_ok = False
                     break
@@ -556,6 +587,9 @@ def run_restore(args):
         remote_props = {p: v for p, v in pairs if p.startswith("zz:") and not p.startswith("zz:last_")}
     except subprocess.CalledProcessError:
         print(f"[!] Could not read properties of {remote_ds} on {remote_host}.", flush=True); return True
+    # Send back the same way it was sent (e.g. raw for encrypted data)
+    try: rflags = " ".join(parse_send_flags(remote_props.get("zz:send_flags")))
+    except ValueError as e: print(f"[!] Remote zz:send_flags: {e}", flush=True); return True
 
     # 1. Finish an interrupted receive, if there is one
     try: token = subprocess.check_output(["zfs", "get", "-H", "-o", "value", "receive_resume_token", local_ds],
@@ -578,7 +612,7 @@ def run_restore(args):
     else:
         mode = "latest snapshot only" if args.latest else "full history"
         print(f"[*] Restoring @{latest} ({mode})...", flush=True)
-        send = f"zfs send -v {remote_ds}@{latest}" if args.latest else f"zfs send -R -v {remote_ds}@{latest}"
+        send = f"zfs send {'-v' if args.latest else '-R -v'} {rflags} {remote_ds}@{latest}"
         if run_transfer(["ssh", remote_host, send], recv_cmd) != 0:
             print("[!] Restore interrupted. Run the same command to resume.", flush=True); return True
 
@@ -587,7 +621,8 @@ def run_restore(args):
     if local_snaps and local_snaps[0] != latest:
         if local_snaps[0] not in remote_snaps:
             print(f"[!] Local @{local_snaps[0]} not found on remote; cannot continue.", flush=True); return True
-        flags = "-v -i" if args.latest else "-R -v -I"
+        # Flags must come before -i/-I, which takes the next argument as its snapshot
+        flags = ("-v" if args.latest else "-R -v") + (f" {rflags}" if rflags else "") + (" -i" if args.latest else " -I")
         print(f"[*] Catching up @{local_snaps[0]} -> @{latest}...", flush=True)
         if run_transfer(["ssh", remote_host, f"zfs send {flags} @{local_snaps[0]} {remote_ds}@{latest}"], recv_cmd) != 0:
             print("[!] Restore interrupted. Run the same command to resume.", flush=True); return True
@@ -604,11 +639,19 @@ def run_restore(args):
         for host, path in ((None, local_ds), (remote_host, remote_ds)):
             err = pin_bridge(path, latest, host)
             if err: print(f"    [!] {err}", flush=True)
-    res = subprocess.check_output(["zfs", "list", "-H", "-o", "name,canmount,mounted", "-r", local_ds], encoding='utf-8')
-    for n, canmount, mounted in (l.split('\t') for l in res.splitlines() if l):
+    res = subprocess.check_output(["zfs", "list", "-H", "-o", "name,canmount,mounted,keystatus", "-r", local_ds], encoding='utf-8')
+    locked = []
+    for n, canmount, mounted, keystatus in (l.split('\t') for l in res.splitlines() if l):
+        if keystatus == "unavailable": locked.append(n); continue
         if canmount == "off" or mounted == "yes": continue
         if subprocess.run(["zfs", "mount", n], stderr=subprocess.DEVNULL).returncode != 0:
             print(f"    [!] Could not mount {n}; check its mountpoint.", flush=True)
+    if locked:
+        # A raw (encrypted) restore arrives locked, with keylocation reset to prompt
+        print(f"    [!] {local_ds} is encrypted and its key isn't loaded, so it wasn't mounted. Load it with:\n"
+              f"          zfs load-key {local_ds}      (or: zfs load-key -L file:///path/to/key {local_ds})\n"
+              f"          zfs mount -a\n"
+              f"        and set keylocation if it should load automatically at boot.", flush=True)
     if owners:
         print(f"[+] Restore complete at @{latest}. {owners[0]} already replicates to {args.remote}, "
               f"so {local_ds} was left unmanaged (use 'zz init' to replicate it elsewhere).", flush=True)
@@ -748,15 +791,18 @@ def run_meta(args):
     print("-" * 65, flush=True)
     fields = [('Remote Target','target','zz:target'), ('Sync Frequency','freq','zz:freq'), 
               ('Local Retention','keep_local','zz:keep_local'), ('Remote Retention','keep_remote','zz:keep_remote'),
-              ('Safety Floor (Min)','keep_min','zz:keep_min')]
+              ('Safety Floor (Min)','keep_min','zz:keep_min'), ('Send Flags','send_flags','zz:send_flags')]
     for d, k, p in fields:
         val = ds.props.get(p, "-")
+        if k == 'send_flags' and val == "-": val = "none (set up before zz 0.5)"
         if k in ['freq', 'keep_local', 'keep_remote'] and val != "-":
             try: val = human_duration(parse_duration(val))
             except ValueError: val = f"{val} (INVALID)"
         print(f"{d:<22} | {k:<12} | {val}", flush=True)
 
 def run_set(args):
+    args.value = " ".join(args.value).strip()
+    if not args.value: print("[!] Not updated: a value is required.", flush=True); return True
     ds = ZzDataset(args.dataset)
     if ds.props is None:
         print(f"[!] Error: Dataset '{args.dataset}' not found.", flush=True); return True
@@ -764,9 +810,13 @@ def run_set(args):
         if args.prop in ('freq', 'keep_local', 'keep_remote'): parse_duration(args.value)
         elif args.prop == 'keep_min': keep_min_arg(args.value)
         elif args.prop == 'target': parse_target(args.value)
+        elif args.prop == 'send_flags': parse_send_flags(args.value)
     except (ValueError, argparse.ArgumentTypeError) as e:
         print(f"[!] Not updated: {e}", flush=True); return True
     ds.set_prop(args.prop, args.value); print(f"[*] Updated {args.prop} to {args.value}", flush=True)
+    if args.prop == 'send_flags':
+        print("    Note: if the next sync fails with a message about flags not matching a previous receive,\n"
+              "    set send_flags back to its old value.", flush=True)
 
 def run_abort(args):
     ds = managed_dataset(args.dataset)
@@ -809,6 +859,8 @@ def main():
     pi.add_argument('dataset'); pi.add_argument('remote')
     pi.add_argument('--freq', default='60m', type=duration_arg); pi.add_argument('--keep-local', default='7d', type=duration_arg)
     pi.add_argument('--keep-remote', default='30d', type=duration_arg); pi.add_argument('--keep-min', default='10', type=keep_min_arg)
+    pi.add_argument('--send-flags', type=send_flags_arg,
+                    help="zfs send flags (default: -w for encrypted datasets, otherwise -L -c; 'none' for plain sends)")
     pi.set_defaults(func=run_init)
     ps = subparsers.add_parser('sync', help='Snapshot if due and send to the remote: [dataset] [--now]',
                                description='Take a snapshot if one is due, send any unsent snapshots, and prune.')
@@ -827,7 +879,7 @@ def main():
     pn.add_argument('--all', action='store_true', help='show every snapshot')
     pn.set_defaults(func=run_snaps)
     pm = subparsers.add_parser('meta', help='Show a dataset\'s settings: <dataset>'); pm.add_argument('dataset'); pm.set_defaults(func=run_meta)
-    pset = subparsers.add_parser('set', help='Change a setting: <dataset> <prop> <value>'); pset.add_argument('dataset'); pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min']); pset.add_argument('value'); pset.set_defaults(func=run_set)
+    pset = subparsers.add_parser('set', help='Change a setting: <dataset> <prop> <value>'); pset.add_argument('dataset'); pset.add_argument('prop', choices=['target', 'freq', 'keep_local', 'keep_remote', 'keep_min', 'send_flags']); pset.add_argument('value', nargs=argparse.REMAINDER, help="new value (e.g. 7d, or send flags such as -L -c)"); pset.set_defaults(func=run_set)
     pa = subparsers.add_parser('abort', help='Discard an interrupted transfer on the remote: <dataset>'); pa.add_argument('dataset'); pa.set_defaults(func=run_abort)
     pf = subparsers.add_parser('forget', help='Stop managing a dataset (data is kept): <dataset>'); pf.add_argument('dataset'); pf.set_defaults(func=run_forget)
     pr = subparsers.add_parser('restore', help='Recreate a dataset from the remote: <host:pool/dataset> <dataset> [--latest]'); pr.add_argument('remote'); pr.add_argument('local_dataset'); pr.add_argument('--latest', action='store_true'); pr.set_defaults(func=run_restore)

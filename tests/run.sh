@@ -73,7 +73,11 @@ others() { zfs get -H -t filesystem -s local -o name zz:target 2>/dev/null | gre
 alone()  { [ -z "$(others)" ]; }
 nsnaps() { zfs list -H -t snapshot -o name -d 1 "$1" 2>/dev/null | grep -c '@zz_auto_'; }
 newest() { zfs list -H -t snapshot -o name -S creation -d 1 "$1" | grep '@zz_auto_' | head -1 | cut -d@ -f2; }
-prop()   { zfs get -H -s local -o value "zz:$1" "$DS"; }
+prop()   { zfs get -H -s local -o value "zz:$1" "${2:-$DS}"; }
+val()    { zfs get -H -o value "$1" "$2"; }
+# bytes reported by the last "[+] Sent ...: <size> in" line in $OUT, as an integer
+sent_bytes() { grep -o '\[+\] Sent .*: [0-9.]*[BKMGT] in' <<<"$OUT" | tail -1 | sed -E 's/.*: ([0-9.]+)([BKMGT]) in/\1 \2/' |
+               awk '{m=($2=="K")?1024:($2=="M")?1048576:($2=="G")?1073741824:1; printf "%d", $1*m}'; }
 # mountpoint may or may not already include the pool's altroot, depending on ZFS version
 mnt()    { local m; m=$(zfs get -H -o value mountpoint "$1"); [ -d "$m" ] && echo "$m" || echo "$MNT$m"; }
 write()  { head -c "$2" /dev/urandom > "$(mnt "$DS")/$1"; }
@@ -91,6 +95,9 @@ if [ $SKIP = 0 ] || true; then   # always runs: everything depends on it
     check "remote parent created"         exists "$DST/bk"
     check "data landed at exact path"     [ "$(nsnaps "$RP")" = 1 ]
     check "last_sent recorded"            [ -n "$(prop last_sent)" ]
+    check "default send flags -L -c"      [ "$(prop send_flags)" = "-L -c" ]
+    check "replica won't auto-mount"      [ "$(val canmount "$RP")" = noauto ]
+    check "replica is read-only"          [ "$(val readonly "$RP")" = on ]
     run init "$DS" "$TARGET"
     check "second init refuses existing remote"   rc_is 1
     check "…and says so"                  out_has "already exists"
@@ -184,7 +191,8 @@ fi
 T diverged_replica
 if [ $SKIP = 0 ]; then
     bridge=$(newest "$RP")
-    zfs mount "$RP" 2>/dev/null; date > "$(mnt "$RP")/diverge"
+    check "read-only replica refuses writes" bash -c "zfs mount '$RP' 2>/dev/null; ! date > '$(mnt "$RP")/diverge' 2>/dev/null"
+    zfs set readonly=off "$RP"; date > "$(mnt "$RP")/diverge"
     tick; run sync "$DS" --now
     check "sync fails on modified replica"  rc_is 1
     check "…with zfs's reason"              out_has "has been modified"
@@ -199,7 +207,7 @@ if [ $SKIP = 0 ]; then
     run status
     check "status ERROR, exit 1"            rc_is 1
     check "…lists the error"                out_has "Transfer failed"
-    zfs rollback "$RP@$bridge"; zfs unmount "$RP" 2>/dev/null
+    zfs rollback "$RP@$bridge"; zfs unmount "$RP" 2>/dev/null; zfs set readonly=on "$RP"
     run sync "$DS"
     check "recovers after rollback"         rc_is 0
     check "…sends every pending snapshot"   [ "$(newest "$RP")" = "$(newest "$DS")" ]
@@ -230,7 +238,7 @@ if [ $SKIP = 0 ]; then
     (cd "$(mnt "$DS")" && sha256sum f1 f2) > "$WORK/sums"
     wipe "$DS"
     # Cut the stream inside the first (40M+) snapshot: leaves a real resume token
-    zfs send -R "$RP@$(newest "$RP")" | head -c 15M | zfs recv -s -u "$DS" 2>/dev/null
+    zfs send -R -L -c "$RP@$(newest "$RP")" | head -c 15M | zfs recv -s -u "$DS" 2>/dev/null
     check "partial receive left a resume token" [ "$(zfs get -H -o value receive_resume_token "$DS" 2>/dev/null)" != "-" ]
     run status
     check "partial dataset not treated as managed" out_lacks "$DS "
@@ -252,7 +260,7 @@ T restore_partial_between_snapshots
 if [ $SKIP = 0 ]; then
     wipe "$DS"
     oldest=$(zfs list -H -t snapshot -o name -s creation -d 1 "$RP" | grep '@zz_auto_' | head -1)
-    zfs send "$oldest" | zfs recv -u "$DS"
+    zfs send -L -c "$oldest" | zfs recv -u "$DS"
     run restore "$TARGET" "$DS"
     check "restore continues a partial copy" rc_is 0
     check "…detected as partial"            out_has "Continuing partial restore"
@@ -268,6 +276,78 @@ if [ $SKIP = 0 ]; then
     check "…and no holds on the copy"       [ -z "$(held "$SRC/copy")" ]
     run forget "$SRC/copy"
     check "forget on unmanaged copy errors" rc_is 1
+fi
+
+T send_flags_compressed
+if [ $SKIP = 0 ]; then
+    C=$SRC/comp; zfs create -o compression=lz4 "$C"
+    run init "$C" zzremote:$DST/bk/comp --freq 1h
+    yes 'zz compressible test line ' | head -c 30M > "$(mnt "$C")/text"; tick
+    run sync "$C" --now
+    check "compressed sync succeeds"        rc_is 0
+    check "30M of compressible data sends under 5M with -c" [ "$(sent_bytes)" -lt 5242880 ]
+fi
+
+T send_flags_legacy
+if [ $SKIP = 0 ]; then
+    G=$SRC/legacy; zfs create -o compression=lz4 "$G"
+    run init "$G" zzremote:$DST/bk/legacy --freq 1h --send-flags none
+    zfs inherit zz:send_flags "$G"   # exactly as a replication set up before 0.5 looks
+    run meta "$G"
+    check "meta explains missing send flags" out_has "none (set up before zz 0.5)"
+    yes 'zz compressible test line ' | head -c 30M > "$(mnt "$G")/text"; tick
+    run sync "$G" --now
+    check "flagless (pre-0.5) replication still syncs" rc_is 0
+    check "…sending uncompressed (over 25M)" [ "$(sent_bytes)" -gt 26214400 ]
+    run set "$G" send_flags "-L -c"
+    check "set send_flags accepted"         rc_is 0
+    yes 'more compressible text ' | head -c 30M > "$(mnt "$G")/text2"; tick
+    run sync "$G" --now
+    echo "       (switching an existing replication to -L -c: exit $RC, sent $(sent_bytes) bytes)"
+    check "switching to -L -c works on an existing replication" rc_is 0
+    check "…and sends compressed from then on" [ "$(sent_bytes)" -lt 5242880 ]
+    run set "$G" send_flags -F
+    check "set rejects unknown send flags"  rc_is 1
+    run set "$G" send_flags -L -c
+    check "set takes unquoted flags"        rc_is 0
+    check "…stored as given"                [ "$(prop send_flags "$G")" = "-L -c" ]
+fi
+
+T send_flags_large_blocks
+if [ $SKIP = 0 ]; then
+    B=$SRC/big; zfs create -o recordsize=1M "$B"
+    run init "$B" zzremote:$DST/bk/big --freq 1h
+    head -c 8M /dev/urandom > "$(mnt "$B")/rand"; tick
+    run sync "$B" --now
+    check "1M-recordsize dataset syncs"     rc_is 0
+    check "…replica keeps 1M records"       [ "$(val recordsize $DST/bk/big)" = 1M ]
+fi
+
+T send_flags_encrypted
+if [ $SKIP = 0 ]; then
+    E=$SRC/enc; ER=$DST/bk/enc
+    echo "zz-test-passphrase" > "$WORK/key"
+    zfs create -o encryption=on -o keyformat=passphrase -o keylocation="file://$WORK/key" "$E"
+    run init "$E" zzremote:$ER --freq 1h
+    check "encrypted dataset: init succeeds" rc_is 0
+    check "…chooses raw sends (-w)"         [ "$(prop send_flags "$E")" = "-w" ]
+    check "replica is encrypted"            [ "$(val encryption "$ER")" != off ]
+    check "…and never had the key"          [ "$(val keystatus "$ER")" = unavailable ]
+    head -c 6M /dev/urandom > "$(mnt "$E")/secret"; tick
+    run sync "$E" --now
+    check "raw incremental sync"            rc_is 0
+    (cd "$(mnt "$E")" && sha256sum secret) > "$WORK/encsums"
+    wipe "$E"
+    run restore "zzremote:$ER" "$E"
+    check "raw restore succeeds"            rc_is 0
+    check "…says the key must be loaded"    out_has "zfs load-key"
+    check "…arrives locked"                 [ "$(val keystatus "$E")" = unavailable ]
+    zfs load-key -L "file://$WORK/key" "$E" && zfs mount "$E"
+    check "after load-key: data intact"     bash -c "cd '$(mnt "$E")' && sha256sum -c --quiet '$WORK/encsums'"
+    head -c 1M /dev/urandom > "$(mnt "$E")/more"; tick
+    run sync "$E" --now
+    check "raw sync continues after restore" rc_is 0
+    check "…replica still never had the key" [ "$(val keystatus "$ER")" = unavailable ]
 fi
 
 T forget

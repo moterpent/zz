@@ -53,7 +53,7 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```
 Each run logs a header with the version and time, then one line per snapshot sent:
 ```
---- zz 0.4.0 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
+--- zz 0.5.0 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
 [*] tank/data: Taking scheduled snapshot @zz_auto_1790630101...
     [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
     [*] Pruning local...
@@ -178,7 +178,7 @@ Every push runs two suites on GitHub Actions:
   ```bash
   python3 tests/test_units.py
   ```
-* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
+* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, send flags (compressed, large-block, encrypted raw, and pre-0.5 replications), concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
   ```bash
   sudo tests/run.sh             # everything (about 2 minutes)
   sudo tests/run.sh restore     # only tests whose name contains "restore"
@@ -188,7 +188,7 @@ Every push runs two suites on GitHub Actions:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.4.0 (8987d98)
+zz 0.5.0 (8a97506)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
@@ -204,6 +204,7 @@ Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`
 |zz:keep_local |Local retention window|7d|1h, 2h, 1d|
 |zz:keep_remote|Remote retention window|30d|24h, 30d, 1y|
 |zz:keep_min   |Safety floor: newest N snapshots never pruned, on either side, regardless of age|10|24|
+|zz:send_flags |zfs send flags, chosen at init (see Send Flags below)|`-w` if encrypted, else `-L -c`|-L -c|
 |zz:last_sync  |Time of last scheduled snapshot; the schedule counts from it (managed by zz)|-|1790626501|
 |zz:last_sent  |Time of newest snapshot confirmed on remote (managed by zz)|-|1790626501|
 |zz:last_error |Last sync failure, cleared on success (managed by zz)|-|1790626501 Could not retrieve...|
@@ -214,9 +215,17 @@ Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`
 * **Bridge Holds:** Incremental replication needs the newest snapshot both sides share (the "bridge"). zz places a ZFS hold named `zz_bridge` on it on both sides, and moves the hold forward after each sync, so it can't be destroyed by accident. Deleting that one snapshot, or the whole dataset, fails with "dataset is busy" until the hold is released. To see holds: `zfs holds pool/data@zz_auto_...`. If you really mean to delete: `zfs release -r zz_bridge pool/data@zz_auto_...`, or run `zz forget` first, which releases zz's holds on both sides. `zz snaps` shows whether the bridge is held.
 * **Remote Integrity:** zz uses incremental sends without the -F (Force) flag. Do
   not modify the remote dataset directly (keep it readonly=on) to avoid stream
-divergence. If it is modified, syncs fail with "destination has been modified" and
+divergence. Replicas created by `zz init` 0.5 or later are received with `readonly=on` and
+`canmount=noauto`, so they can't be written to by accident and won't try to mount at the
+primary's mountpoint when the backup host boots. For older replicas you can set these by
+hand on the backup host: `zfs set readonly=on canmount=noauto pool/data`. If it is modified, syncs fail with "destination has been modified" and
 `zz status` shows `ERROR`; roll the remote back to its newest `zz_auto_` snapshot
 (`zfs rollback pool/data@zz_auto_...`) and the next sync catches up.
+* **Send Flags:** `init` chooses how snapshots are sent and stores it in `zz:send_flags`, so it never changes underneath an existing replication:
+  * **Unencrypted datasets: `-L -c`.** Compressed blocks travel compressed (often 2-3× less data for `lz4`/`zstd` datasets), and large records (`recordsize` over 128K) aren't split. `-e` is left out because its streams can't be received into an encrypted dataset on the backup host.
+  * **Encrypted datasets: `-w` (raw).** Data is sent still encrypted. The backup host never has the key, so it can be an untrusted machine. After a `zz restore` of an encrypted dataset, load the key (`zfs load-key pool/data`) and mount it; zz prints the exact commands. A raw receive resets `keylocation` to `prompt`, so set it again if the key should load at boot.
+  * **Replications set up before zz 0.5 have no send flags** and keep sending exactly as before. To opt in: `zz set pool/data send_flags -L -c`. In testing, switching an existing unencrypted replication this way worked on the next sync; if a sync fails with a message about flags not matching a previous receive, set it back with `zz set pool/data send_flags none`. Don't switch an unencrypted replication to `-w` or vice versa.
+  * To choose flags yourself at init: `zz init ... --send-flags=-L` (use `=`, since the value starts with a dash), or `--send-flags=none`.
 * **Lock Files:** Stored in `/run/zz/` (root-only; override with `ZZ_LOCK_DIR`). A short lock serializes snapshotting, and a second lock prevents overlapping transfers, so snapshots are still taken on schedule while a long transfer runs.
 * **Schedule Drift:** A snapshot is taken when at least `freq` minus 30 seconds has
 passed since the last one. Without that allowance, a cron run a second early would

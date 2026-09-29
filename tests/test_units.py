@@ -41,6 +41,19 @@ class ParseTarget(unittest.TestCase):
                 zz.parse_target(bad)
 
 
+class SendFlags(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(zz.parse_send_flags(None), [])      # replications set up before 0.5
+        self.assertEqual(zz.parse_send_flags("none"), [])
+        self.assertEqual(zz.parse_send_flags("-L -c"), ["-L", "-c"])
+        self.assertEqual(zz.parse_send_flags("-w"), ["-w"])
+
+    def test_invalid(self):
+        for bad in ["-F", "-L -R", "--raw", "rm -rf", "-Lc"]:
+            with self.assertRaises(ValueError, msg=bad):
+                zz.parse_send_flags(bad)
+
+
 class Formatting(unittest.TestCase):
     def test_human_bytes(self):
         self.assertEqual(zz.human_bytes(0), "0B")
