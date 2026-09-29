@@ -1,8 +1,11 @@
 name: tests
 
 on:
+  # Documentation-only changes can't affect zz, so they don't need the test run
   push:
+    paths-ignore: ['**.md', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'LICENSE']
 
 jobs:
   unit:
