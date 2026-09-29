@@ -53,7 +53,7 @@ Add zz sync to your crontab. It handles its own locking and timing checks.
 ```
 Each run logs a header with the version and time, then one line per snapshot sent:
 ```
---- zz 0.3.4 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
+--- zz 0.4.0 (a1b2c3d) sync @ 2026-09-28 15:15:01 ---
 [*] tank/data: Taking scheduled snapshot @zz_auto_1790630101...
     [+] Sent tank/data @zz_auto_1790626501 -> @zz_auto_1790630101: 5.8M in 0.4s
     [*] Pruning local...
@@ -101,7 +101,7 @@ zz snaps tank/data            # dataset is optional when only one is managed
 SNAPSHOT (local time) |      GAP |  WRITTEN | LOCAL USED | REMOTE USED | STATE
 ------------------------------------------------------------------------------------------
 2026-09-28 16:15      |     1:00 |     5.8M |       1.2M |           - | pending
-2026-09-28 15:15      |     1:00 |     9.0M |       1.8M |          0B | both  <- bridge
+2026-09-28 15:15      |     1:00 |     9.0M |       1.8M |          0B | both  <- bridge, held local + remote
 2026-09-28 14:15      |     1:00 |   359.7M |       7.7M |        7.9M | both
 ...
 LOCAL   167 snapshots, 41.6G held by snapshots, oldest 2026-09-21 16:55
@@ -110,7 +110,7 @@ REMOTE  191 snapshots, 46.0G held by snapshots, oldest 2026-09-20 16:55
 * **GAP**: time since the previous snapshot; outages and `--now` snapshots stand out.
 * **WRITTEN**: data changed during that interval, roughly the size of its send.
 * **USED**: space that deleting that one snapshot would free on that side. Usually small, since data is shared with neighbouring snapshots; the newest snapshot on the remote typically shows 0B.
-* **STATE**: `both`, `pending` (not yet sent), `local only`, or `remote only` (pruned locally, normal with a shorter local retention). The **bridge** is the newest snapshot on both sides; the next sync sends everything after it.
+* **STATE**: `both`, `pending` (not yet sent), `local only`, or `remote only` (pruned locally, normal with a shorter local retention). The **bridge** is the newest snapshot on both sides; the next sync sends everything after it. It's marked with where it is protected by a `zz_bridge` hold (see Important Notes).
 * Shows the newest 24 by default; `--limit N` or `--all` for more.
 
 For any other `zfs list -t snap` output, including on a host that zz doesn't manage (such as the replica), `util/zz-delta` converts the epoch timestamps in `zz_auto_` names to readable times and gaps:
@@ -178,7 +178,7 @@ Every push runs two suites on GitHub Actions:
   ```bash
   python3 tests/test_units.py
   ```
-* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
+* **Integration tests** (`tests/run.sh`): real ZFS on two throwaway file-backed pools, covering init, sync, `--now`, bridge holds, concurrent runs, a diverged replica (pruning must never remove unsent snapshots), a missing bridge snapshot, and restores that resume after being interrupted mid-snapshot and between snapshots. Needs root and ZFS; existing pools are never touched, and everything it creates is destroyed on exit:
   ```bash
   sudo tests/run.sh             # everything (about 2 minutes)
   sudo tests/run.sh restore     # only tests whose name contains "restore"
@@ -188,7 +188,7 @@ Every push runs two suites on GitHub Actions:
 ## 🏷️ Versioning
 `zz --version` reports the release version from `__version__` in the script. When run from a git checkout (e.g. `/usr/local/bin/zz` symlinked into a clone), the commit is appended, with `-dirty` if the script has local modifications:
 ```
-zz 0.3.4 (e2868c7)
+zz 0.4.0 (8987d98)
 ```
 The same string heads `zz status` output and each `zz sync` run in the log. Bump `__version__` for any behavior change.
 
@@ -211,6 +211,7 @@ Durations accept `m`, `h`, `d`, `w` and `y` (e.g. `30m`, `12h`, `7d`, `2w`, `1y`
 
 ## ⚠️ Important Notes
 * **Snapshots:** zz only manages snapshots prefixed with @zz_auto_.
+* **Bridge Holds:** Incremental replication needs the newest snapshot both sides share (the "bridge"). zz places a ZFS hold named `zz_bridge` on it on both sides, and moves the hold forward after each sync, so it can't be destroyed by accident. Deleting that one snapshot, or the whole dataset, fails with "dataset is busy" until the hold is released. To see holds: `zfs holds pool/data@zz_auto_...`. If you really mean to delete: `zfs release -r zz_bridge pool/data@zz_auto_...`, or run `zz forget` first, which releases zz's holds on both sides. `zz snaps` shows whether the bridge is held.
 * **Remote Integrity:** zz uses incremental sends without the -F (Force) flag. Do
   not modify the remote dataset directly (keep it readonly=on) to avoid stream
 divergence. If it is modified, syncs fail with "destination has been modified" and

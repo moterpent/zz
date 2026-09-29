@@ -13,7 +13,7 @@ import functools
 import shutil
 import threading
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -240,6 +240,39 @@ def run_transfer(send_cmd, recv_cmd, summary=None):
         print(f"    [+] Sent {summary}: {human_bytes(total)} in {time.monotonic() - start:.1f}s", flush=True)
     return rc
 
+HOLD_TAG = "zz_bridge"
+
+def zfs_on(host, *args):
+    """argv for a zfs command, locally or on host over ssh."""
+    return (["ssh", "-o", "BatchMode=yes", host] if host else []) + ["zfs"] + list(args)
+
+def held_bridges(dataset, host=None):
+    """Snapshot names (after '@') of this dataset carrying a zz_bridge hold."""
+    res = subprocess.check_output(zfs_on(host, "list", "-H", "-t", "snapshot", "-o", "name,userrefs", "-d", "1", dataset),
+                                  encoding='utf-8', stderr=subprocess.DEVNULL)
+    busy = [n for n, refs in (l.split('\t') for l in res.splitlines() if l) if refs != "0"]
+    if not busy: return set()
+    res = subprocess.check_output(zfs_on(host, "holds", "-H", *busy), encoding='utf-8', stderr=subprocess.DEVNULL)
+    return {l.split('\t')[0].split('@', 1)[1] for l in res.splitlines() if l.split('\t')[1:2] == [HOLD_TAG]}
+
+def pin_bridge(dataset, bridge, host=None):
+    """Hold the bridge snapshot (and its children's) so it can't be destroyed by accident, then
+    release zz's hold on any earlier bridge. Holding first means a common snapshot is always
+    protected. With bridge=None, just releases. Returns an error message or None."""
+    side = host or "local"
+    try:
+        held = held_bridges(dataset, host)
+        if bridge and bridge not in held:
+            subprocess.run(zfs_on(host, "hold", "-r", HOLD_TAG, f"{dataset}@{bridge}"), check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for old in held - {bridge}:
+            subprocess.run(zfs_on(host, "release", "-r", HOLD_TAG, f"{dataset}@{old}"), check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or b"").decode(errors="replace").strip() if isinstance(e.stderr, bytes) else ""
+        return f"Could not update {HOLD_TAG} hold on {side} {dataset}" + (f": {detail}" if detail else ".")
+    return None
+
 def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
     """Destroy expired zz_auto_ snapshots on one side. Returns True if pruning failed."""
     is_remote = remote_host is not None
@@ -272,6 +305,9 @@ def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
             return False
         # snapshots is newest-first, so only those after the bridge are older than it
         candidates = snapshots[max(keep_min, tags.index(bridge) + 1):]
+    elif bridge:
+        # The remote's bridge is normally its newest snapshot, but keep_min may be 0
+        candidates = [c for c in candidates if c[0].split('@', 1)[1] != bridge]
     now = int(time.time())
     failed = []
     for snap in [s[0] for s in candidates if (now - s[1]) > retention_sec]:
@@ -320,7 +356,11 @@ def run_init(args):
     print(f"[*] Starting initial transfer (Resumable)...", flush=True)
     send_cmd = ["zfs", "send", "-R", "-v", f"{args.dataset}@{snap}"]
     if run_transfer(send_cmd, recv_cmd) == 0:
-        ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap); print("[+] Init successful.", flush=True)
+        ds.set_prop("last_sync", int(time.time())); ds.record_sent(snap)
+        for host, path in ((None, args.dataset), (remote_host, remote_path)):
+            err = pin_bridge(path, snap, host)
+            if err: print(f"    [!] {err}", flush=True)
+        print("[+] Init successful.", flush=True)
     else:
         print("[!] Transfer interrupted. Run again to resume.", flush=True); return True
 
@@ -456,10 +496,14 @@ def run_sync(args):
         if not send_ok:
             ds.record_error(f"Transfer failed at @{next_tag}. Will resume later."); failed = True
 
+        # current_base is the newest snapshot confirmed on the remote: protect it on both sides
+        for host, path in ((None, ds.name), (remote_host, remote_path)):
+            err = pin_bridge(path, current_base, host)
+            if err: ds.record_error(err); failed = True
+
         # Always try to prune after a successful check/sync
-        # current_base is the newest snapshot confirmed on the remote
         if run_prune(ds, bridge=current_base): failed = True
-        if run_prune(ds, remote_host, remote_path=remote_path): failed = True
+        if run_prune(ds, remote_host, bridge=current_base, remote_path=remote_path): failed = True
         
         fcntl.flock(lock_f, fcntl.LOCK_UN)
         lock_f.close()
@@ -468,8 +512,16 @@ def run_sync(args):
 def run_forget(args):
     ds = managed_dataset(args.dataset)
     if not ds: return True
+    # Release zz's holds first, so nothing is left mysteriously undeletable
+    failed = False
+    try: remote = parse_target(ds.target)
+    except ValueError: remote = None
+    for host, path in ((None, ds.name),) + (((remote[0], remote[1]),) if remote else ()):
+        err = pin_bridge(path, None, host)
+        if err: print(f"    [!] {err} Release it with: zfs release -r {HOLD_TAG} <snapshot>", flush=True); failed = True
     for prop in list(ds.props.keys()): subprocess.run(["zfs", "inherit", prop, ds.name])
     print(f"[+] {ds.name} is no longer managed by zz. Its data and snapshots were kept.", flush=True)
+    return failed
 
 def zz_snaps(dataset, host=None):
     """zz_auto_ snapshot tags of exactly this dataset, newest first. Raises on failure."""
@@ -549,6 +601,9 @@ def run_restore(args):
         ds = ZzDataset(local_ds)
         for pk, pv in remote_props.items(): ds.set_prop(pk.split(':', 1)[1], pv)
         ds.set_prop("target", args.remote); ds.set_prop("last_sync", int(time.time())); ds.record_sent(latest)
+        for host, path in ((None, local_ds), (remote_host, remote_ds)):
+            err = pin_bridge(path, latest, host)
+            if err: print(f"    [!] {err}", flush=True)
     res = subprocess.check_output(["zfs", "list", "-H", "-o", "name,canmount,mounted", "-r", local_ds], encoding='utf-8')
     for n, canmount, mounted in (l.split('\t') for l in res.splitlines() if l):
         if canmount == "off" or mounted == "yes": continue
@@ -644,6 +699,10 @@ def run_snaps(args):
     except subprocess.CalledProcessError:
         remote, remote_held, remote_ok = {}, None, False
 
+    try: held_l = held_bridges(name)
+    except subprocess.CalledProcessError: held_l = set()
+    try: held_r = held_bridges(remote_path, remote_host) if remote_ok else set()
+    except subprocess.CalledProcessError: held_r = set()
     both = [t for t in local if t in remote]
     bridge = max(both, key=lambda t: local[t][0]) if both else None
     tags = sorted(set(local) | set(remote), key=lambda t: (local.get(t) or remote[t])[0], reverse=True)
@@ -659,7 +718,9 @@ def run_snaps(args):
         elif t in local and t in remote: state = "both"
         elif t in local: state = "pending" if bridge is None or creation > local[bridge][0] else "local only"
         else: state = "remote only"
-        if t == bridge: state += "  <- bridge"
+        if t == bridge:
+            sides = [n for n, h in (("local", held_l), ("remote", held_r)) if t in h]
+            state += "  <- bridge" + (", held " + " + ".join(sides) if sides else ", NOT held")
         when = datetime.datetime.fromtimestamp(creation).strftime('%Y-%m-%d %H:%M')
         lu = human_bytes(local[t][1]) if t in local else "-"
         ru = human_bytes(remote[t][1]) if t in remote else ("?" if not remote_ok else "-")

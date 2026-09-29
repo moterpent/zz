@@ -62,6 +62,11 @@ rc_is() { [ "$RC" = "$1" ] || { echo "       expected exit $1, got $RC; output:"
 out_has() { grep -qF -- "$1" <<<"$OUT" || { echo "       missing: $1"; sed 's/^/       | /' <<<"$OUT"; return 1; }; }
 out_lacks() { ! grep -qF -- "$1" <<<"$OUT" || { echo "       unexpected: $1"; return 1; }; }
 exists() { zfs list -H -o name "$1" >/dev/null 2>&1; }
+# zz_bridge holds on a dataset's snapshots (one name per line)
+held()   { zfs list -H -t snapshot -o name -d 1 "$1" | xargs -r zfs holds -H 2>/dev/null | awk -F'\t' '$2=="zz_bridge"{print $1}'; }
+# Release zz's holds, as an admin deliberately deleting something would have to
+unhold() { held "$1" | xargs -r -n1 zfs release -r zz_bridge; }
+wipe()   { unhold "$1"; zfs destroy -r "$1"; }
 nsnaps() { zfs list -H -t snapshot -o name -d 1 "$1" 2>/dev/null | grep -c '@zz_auto_'; }
 newest() { zfs list -H -t snapshot -o name -S creation -d 1 "$1" | grep '@zz_auto_' | head -1 | cut -d@ -f2; }
 prop()   { zfs get -H -s local -o value "zz:$1" "$DS"; }
@@ -119,6 +124,23 @@ if [ $SKIP = 0 ]; then
     check "…marks the bridge"             out_has "<- bridge"
 fi
 
+T bridge_hold
+if [ $SKIP = 0 ]; then
+    b=$(newest "$RP")
+    check "bridge held locally"             [ "$(held "$DS")" = "$DS@$b" ]
+    check "bridge held on remote"           [ "$(held "$RP")" = "$RP@$b" ]
+    check "local bridge can't be destroyed" bash -c "! zfs destroy '$DS@$b' 2>/dev/null"
+    check "remote bridge can't be destroyed" bash -c "! zfs destroy '$RP@$b' 2>/dev/null"
+    run snaps "$DS"
+    check "snaps shows it held on both sides" out_has "held local + remote"
+    write f3 5M; tick; run sync "$DS" --now
+    nb=$(newest "$RP")
+    check "hold moves to the new bridge (local)"  [ "$(held "$DS")" = "$DS@$nb" ]
+    check "…and on the remote"              [ "$(held "$RP")" = "$RP@$nb" ]
+    unhold "$DS"; unhold "$RP"; run sync "$DS"
+    check "holds restored if removed (self-heal)" [ "$(held "$DS")" = "$DS@$nb" ] && [ "$(held "$RP")" = "$RP@$nb" ]
+fi
+
 T now_keeps_schedule
 if [ $SKIP = 0 ]; then
     anchor=$(prop last_sync); n=$(nsnaps "$DS"); tick
@@ -169,7 +191,9 @@ fi
 
 T missing_bridge
 if [ $SKIP = 0 ]; then
-    zfs destroy "$DS@$(newest "$DS")"; tick
+    b=$(newest "$DS")
+    check "held bridge refuses deletion"    bash -c "! zfs destroy '$DS@$b' 2>/dev/null"
+    unhold "$DS"; zfs destroy "$DS@$b"; tick
     run sync "$DS" --now
     check "missing bridge is an error"      rc_is 1
     check "…says intervention needed"       out_has "manual intervention required"
@@ -185,7 +209,7 @@ fi
 T restore_resume_token
 if [ $SKIP = 0 ]; then
     (cd "$(mnt "$DS")" && sha256sum f1 f2) > "$WORK/sums"
-    zfs destroy -r "$DS"
+    wipe "$DS"
     # Cut the stream inside the first (40M+) snapshot: leaves a real resume token
     zfs send -R "$RP@$(newest "$RP")" | head -c 15M | zfs recv -s -u "$DS" 2>/dev/null
     check "partial receive left a resume token" [ "$(zfs get -H -o value receive_resume_token "$DS" 2>/dev/null)" != "-" ]
@@ -200,13 +224,14 @@ if [ $SKIP = 0 ]; then
     check "data intact (checksums)"         bash -c "cd '$(mnt "$DS")' && sha256sum -c --quiet '$WORK/sums'"
     check "mounted"                         [ "$(zfs get -H -o value mounted "$DS")" = yes ]
     check "managed again"                   [ "$(prop target)" = "$TARGET" ]
+    check "restored primary's bridge held"  [ "$(held "$DS")" = "$DS@$(newest "$DS")" ]
     tick; run sync "$DS" --now
     check "sync after restore: one incremental" [ "$(grep -c '\[+\] Sent' <<<"$OUT")" = 1 ]
 fi
 
 T restore_partial_between_snapshots
 if [ $SKIP = 0 ]; then
-    zfs destroy -r "$DS"
+    wipe "$DS"
     oldest=$(zfs list -H -t snapshot -o name -s creation -d 1 "$RP" | grep '@zz_auto_' | head -1)
     zfs send "$oldest" | zfs recv -u "$DS"
     run restore "$TARGET" "$DS"
@@ -221,6 +246,7 @@ if [ $SKIP = 0 ]; then
     check "restore --latest to new name"    rc_is 0
     check "…left unmanaged"                 out_has "left unmanaged"
     check "…only the latest snapshot"       [ "$(nsnaps "$SRC/copy")" = 1 ]
+    check "…and no holds on the copy"       [ -z "$(held "$SRC/copy")" ]
     run forget "$SRC/copy"
     check "forget on unmanaged copy errors" rc_is 1
 fi
@@ -229,6 +255,8 @@ T forget
 if [ $SKIP = 0 ]; then
     run forget "$DS"
     check "forget succeeds"                 rc_is 0
+    check "…releases local holds"           [ -z "$(held "$DS")" ]
+    check "…releases remote holds"          [ -z "$(held "$RP")" ]
     check "…data kept"                      [ "$(nsnaps "$DS")" -gt 0 ]
     run status
     check "…no longer listed"               out_has "No managed datasets"
