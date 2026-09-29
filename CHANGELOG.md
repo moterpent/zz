@@ -95,7 +95,7 @@ Existing replications keep working without changes. Things you may notice:
 - Two runs starting at once could both take a snapshot.
 
 [0.8.1]: https://github.com/moterpent/zz/releases/tag/v0.8.1
-[0.8.0]: https://github.com/moterpent/zz/releases/tag/v0.8.0
+[0.8.0]: https://github.com/moterpent/zz/commit/8671233 (released as part of 0.8.1)
 [0.7.4]: https://github.com/moterpent/zz/releases/tag/v0.7.4
 [0.7.3]: https://github.com/moterpent/zz/releases/tag/v0.7.3
 [0.7.2]: https://github.com/moterpent/zz/releases/tag/v0.7.2
