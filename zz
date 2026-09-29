@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# zz (Zeasy): minimalist, snapshot-aware ZFS replication. https://github.com/moterpent/zz
+# Copyright (c) 2026 Moter Pent. SPDX-License-Identifier: MIT (see LICENSE). No warranty.
 import subprocess
 import argparse
 import sys

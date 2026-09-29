@@ -221,7 +221,7 @@ divergence. If it is modified, syncs fail with "destination has been modified" a
 passed since the last one. Without that allowance, a cron run a second early would
 defer the snapshot to the next run, and the schedule would creep later over time.
 
-License: 
-MIT License
+## 📄 License
+[MIT](LICENSE) © 2026 Moter Pent. Provided "as is", without warranty of any kind.
 
 Keep it Zeasy.
