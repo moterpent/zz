@@ -41,6 +41,7 @@ host=$1; shift
 [ "$host" = zzunreachable ] && { echo "ssh: connect to host zzunreachable: No route to host" >&2; exit 255; }
 # Tests can slow the remote receive down, to have a transfer reliably in progress
 [ -n "${ZZTEST_SLOW_RECV:-}" ] && [[ "$*" == *"zfs recv"* ]] && sleep "$ZZTEST_SLOW_RECV"
+[ -n "${ZZTEST_SLOW_SSH:-}" ] && sleep "$ZZTEST_SLOW_SSH"
 exec bash -c "$*"
 EOF
 chmod +x "$WORK/bin/ssh"
@@ -219,6 +220,37 @@ if [ $SKIP = 0 ]; then
     check "…and syncing carries on"         rc_is 0
     run set "$DS" target "$TARGET"
     check "…and back again"                 rc_is 0
+fi
+
+T set_admin_lock
+if [ $SKIP = 0 ]; then
+    lockf() { echo "$ZZ_LOCK_DIR/$(echo "$1" | tr / _).$2.lock"; }
+    mkdir -p "$ZZ_LOCK_DIR"
+    # Another admin command (forget, restore, ...) holds the admin lock: set waits, then refuses
+    flock -o "$(lockf "$DS" admin)" sleep 20 & holder=$!; sleep 0.5
+    run set "$DS" freq 2h
+    check "set refused while another zz command holds the dataset" rc_is 1
+    check "…and says why"                   out_has "another zz command is running"
+    check "…value unchanged"                [ "$(prop freq)" = 1h ]
+    tick; run sync "$DS" --now
+    check "a sync isn't blocked by the admin lock" rc_is 0
+    kill $holder 2>/dev/null; wait $holder 2>/dev/null
+    # A running sync holds the transfer lock: set must NOT be blocked by it
+    flock -o "$(lockf "$DS" sync)" sleep 20 & holder=$!; sleep 0.5
+    run set "$DS" keep_remote 60d
+    check "set works while a sync is transferring" rc_is 0
+    run set "$DS" keep_remote 30d
+    kill $holder 2>/dev/null; wait $holder 2>/dev/null
+
+    # set target spends seconds checking the replica over ssh (slowed here); a forget arriving
+    # meanwhile must be refused. Before 0.7.4 the forget succeeded and set then wrote the
+    # target back, leaving an "unmanaged" dataset with a zz:target.
+    ZZTEST_SLOW_SSH=5 zz set "$DS" target "zzalias:$RP" >"$WORK/set.out" 2>&1 & s=$!
+    sleep 1; run forget "$DS"; wait $s
+    check "forget refused while set is working on the dataset" rc_is 1
+    check "…set completed"                  [ "$(prop target)" = "zzalias:$RP" ]
+    run set "$DS" target "$TARGET"
+    check "…and the dataset is still fully managed" rc_is 0
 fi
 
 T now_keeps_schedule
@@ -571,7 +603,7 @@ if [ $SKIP = 0 ]; then
     run init "$L" "zzremote:$DST/bk/lk" --freq 1h
     check "setup: init succeeds"            rc_is 0
     mkdir -p "$ZZ_LOCK_DIR"
-    flock "$(lockf "$L")" sleep 20 & holder=$!; sleep 0.5
+    flock -o "$(lockf "$L")" sleep 20 & holder=$!; sleep 0.5
     run forget "$L"
     check "forget refused while a sync holds the dataset" rc_is 1
     check "…and says why"                   out_has "another zz operation"
@@ -580,7 +612,7 @@ if [ $SKIP = 0 ]; then
     check "abort refused while a sync holds the dataset" rc_is 1
     run sync "$L" --now
     check "a second sync skips instead of waiting" out_has "another zz operation is running"
-    flock "$(lockf "$SRC/lk2")" sleep 20 & holder2=$!; sleep 0.5
+    flock -o "$(lockf "$SRC/lk2")" sleep 20 & holder2=$!; sleep 0.5
     zfs create "$SRC/lk2"
     run init "$SRC/lk2" "zzremote:$DST/bk/lk2"
     check "init refused while its dataset is locked" rc_is 1

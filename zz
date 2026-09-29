@@ -15,7 +15,7 @@ import threading
 import shlex
 import contextlib
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -161,20 +161,24 @@ def try_lock(f, wait):
 
 class Busy(Exception): pass
 
+# Per-dataset locks: "snap" and "sync" are taken by sync (snapshot step / transfer). "admin"
+# serializes the commands that change a dataset's zz state (init, restore, forget, abort, set)
+# with each other. set takes only "admin", so it's never blocked by a running sync.
+ALL_LOCKS = ("admin", "snap", "sync")
+
 @contextlib.contextmanager
-def exclusive(name, wait=5):
-    """Hold both of a dataset's locks (snapshot and transfer), so no sync runs on it meanwhile.
-    Raises Busy rather than waiting out a long transfer."""
+def exclusive(name, kinds=ALL_LOCKS, wait=5):
+    """Hold the given locks on a dataset. Raises Busy rather than waiting out a long operation."""
     held = []
     try:
-        for kind in ("snap", "sync"):
+        for kind in kinds:
             f = open_lock(name, kind); held.append(f)
             if not try_lock(f, wait): raise Busy(name)
         yield
     finally:
         for f in held: f.close()
 
-def locked_on(dataset_of):
+def locked_on(dataset_of, kinds=ALL_LOCKS):
     """Run a command holding the dataset's locks; refuse cleanly if a sync (or another zz
     command) is working on that dataset. Commands validate the name themselves."""
     def wrap(fn):
@@ -184,10 +188,10 @@ def locked_on(dataset_of):
             try: check_dataset(name)
             except ValueError: return fn(args)       # let the command report the bad name
             try:
-                with exclusive(name): return fn(args)
+                with exclusive(name, kinds): return fn(args)
             except Busy:
-                print(f"[!] {name}: another zz operation (probably a sync) is running on it. "
-                      f"Try again when it finishes.", flush=True)
+                what = "another zz command" if kinds == ("admin",) else "another zz operation (probably a sync)"
+                print(f"[!] {name}: {what} is running on it. Try again when it finishes.", flush=True)
                 return True
         return run
     return wrap
@@ -1111,6 +1115,7 @@ def same_replica(ds, host, path):
     if theirs != mine: return f"{host}:{path} doesn't have the bridge snapshot @{bridge}, so it isn't this dataset's replica"
     return None
 
+@locked_on(lambda args: args.dataset, kinds=("admin",))
 def run_set(args):
     args.value = " ".join(args.value).strip()
     ds = managed_dataset(args.dataset)       # validates the name; refuses unmanaged datasets

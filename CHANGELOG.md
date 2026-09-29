@@ -2,6 +2,11 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.7.4] - 2026-09-28
+
+### Fixed
+- `zz set` took no lock, so it could interleave with `forget`, `restore` or `abort`. For example, a `forget` during `set target` (which spends seconds verifying the replica) "succeeded", and `set` then wrote the target back, leaving a half-managed dataset. A new per-dataset "admin" lock serializes `init`, `restore`, `forget`, `abort` and `set`. `set` takes only this lock, so it still works while a sync is transferring; sync doesn't use it.
+
 ## [0.7.3] - 2026-09-28
 
 ### Fixed
@@ -70,6 +75,7 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.7.4]: https://github.com/moterpent/zz/releases/tag/v0.7.4
 [0.7.3]: https://github.com/moterpent/zz/releases/tag/v0.7.3
 [0.7.2]: https://github.com/moterpent/zz/releases/tag/v0.7.2
 [0.7.1]: https://github.com/moterpent/zz/releases/tag/v0.7.1
