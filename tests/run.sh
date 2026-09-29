@@ -56,7 +56,15 @@ zz() { python3 "$REPO/zz" "$@"; }
 # run: capture output in $OUT and exit code in $RC
 run() { OUT=$(zz "$@" 2>&1); RC=$?; }
 ok()   { PASS=$((PASS+1)); echo "  ok   $*"; }
-bad()  { FAIL=$((FAIL+1)); FAILED+=("$CUR: $*"); echo "  FAIL $*"; }
+bad()  {
+    FAIL=$((FAIL+1)); FAILED+=("$CUR: $*"); echo "  FAIL $*"
+    # On GitHub Actions, also emit an annotation: those are readable via the public API,
+    # unlike job logs. Include the tail of the last zz output (newlines encoded as %0A).
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        local tail; tail=$(tail -6 <<<"${OUT:-}" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+        echo "::error title=$CUR: $*::zz exit ${RC:-?}. Last output:%0A$tail"
+    fi
+}
 check() { local desc=$1; shift; if "$@"; then ok "$desc"; else bad "$desc"; fi; }
 rc_is() { [ "$RC" = "$1" ] || { echo "       expected exit $1, got $RC; output:"; sed 's/^/       | /' <<<"$OUT"; return 1; }; }
 out_has() { grep -qF -- "$1" <<<"$OUT" || { echo "       missing: $1"; sed 's/^/       | /' <<<"$OUT"; return 1; }; }
