@@ -2,6 +2,14 @@
 
 All notable changes to zz are recorded here. Versions follow `__version__` in the `zz` script; `zz --version` also shows the git commit when run from a checkout.
 
+## [0.7.1] - 2026-09-28
+
+### Security
+- **Command injection through `zz:target`.** Remote commands were built as strings for the remote shell, and the target was only checked for a colon and a slash. A target like `backup:pool/x; <command>` ran the command as root on the backup host, and a host starting with `-` (e.g. `-oProxyCommand=...`) ran a command as root on the primary. This matters where ZFS permissions are delegated, since a user allowed to set user properties could set `zz:target`, and root's cron runs zz.
+  - Every argument sent over ssh is now quoted, and `--` stops the host being read as an ssh option.
+  - Targets are validated (host characters, never starting with `-`; dataset path characters), in `init` and `set` and again on every use. Local dataset names are validated too, and names with spaces are rejected clearly.
+- README: new Security Considerations section (the trust model, delegated permissions, and push mode's root access to the backup host).
+
 ## [0.7.0] - 2026-09-28
 
 ### Added
@@ -51,5 +59,6 @@ Existing replications keep working without changes. Things you may notice:
 - Many error paths failed silently or with a traceback (bare `except:` blocks, pruning errors, `abort` on a missing dataset, `zz snaps | head`).
 - Two runs starting at once could both take a snapshot.
 
+[0.7.1]: https://github.com/moterpent/zz/releases/tag/v0.7.1
 [0.7.0]: https://github.com/moterpent/zz/releases/tag/v0.7.0
 [0.6.0]: https://github.com/moterpent/zz/releases/tag/v0.6.0

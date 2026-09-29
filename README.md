@@ -176,6 +176,12 @@ Examples:
   zz restore backup:pool/data tank/data
 ```
 
+## 🔒 Security Considerations
+* **zz runs as root and trusts `zz:` properties.** Any dataset with a locally set `zz:target` is replicated by `zz sync` (when no dataset is named) to wherever that property points. If you delegate ZFS permissions to other users (`zfs allow ... userprop`), they could set `zz:target` on their own datasets. In that case, name datasets explicitly in your cron line (`zz sync tank/data`) rather than running `zz sync` for everything.
+* **Targets and dataset names are validated,** and every argument zz sends over ssh is quoted, so a crafted `zz:target` or dataset name can't run commands on either host. Hosts must be a hostname, `user@host`, an IP address or an ssh alias (use an ssh config alias for IPv6); dataset names may use letters, digits, `_ - . :` and `/`, but not spaces.
+* **Push mode gives the primary root access to the backup host.** zz connects from the primary to the backup host as root and runs `zfs recv`, `zfs destroy` (pruning) and `zfs rollback` (only with `restore --rollback-remote`) there. If the primary is compromised, so are its backups on that host. Limit the exposure with a dedicated backup host and key, and keep other data off it. A pull mode, where the backup host connects to the primary instead, is being considered.
+* **Encrypted datasets** are sent raw (`-w`), so the backup host never has the key and can't read the data.
+
 ## 🧪 Testing
 Every push runs two suites on GitHub Actions:
 * **Unit tests** (`tests/test_units.py`): parsing and formatting helpers, on Python 3.9 and 3.12. No ZFS or root needed:

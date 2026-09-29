@@ -12,8 +12,9 @@ import re
 import functools
 import shutil
 import threading
+import shlex
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 # Root-only lock directory (not /tmp, where another user could plant a symlink)
 LOCK_DIR = os.environ.get("ZZ_LOCK_DIR", "/run/zz")
@@ -55,7 +56,7 @@ def ds_duration(ds, prop, default):
 # changing them mid-replication can make incremental receives fail.
 SEND_FLAGS = ("-L", "-c", "-e", "-w")
 # Received on the replica by init: don't auto-mount at the primary's mountpoint, don't allow writes
-REPLICA_RECV_OPTS = "-o canmount=noauto -o readonly=on"
+REPLICA_RECV_OPTS = ["-o", "canmount=noauto", "-o", "readonly=on"]
 
 def parse_send_flags(val):
     """zz:send_flags value -> list of zfs send flags. Absent/'none' means none (pre-0.5 replications)."""
@@ -98,12 +99,32 @@ def snap_time(tag):
     try: return int(tag.rsplit('_', 1)[1])
     except (IndexError, ValueError): return 0
 
+# ZFS allows letters, digits, _ - . : (and space) in names. zz rejects spaces rather than half-support them.
+DATASET_RE = re.compile(r'^[A-Za-z0-9_.:-]+(/[A-Za-z0-9_.:-]+)*$')
+# user@host, a hostname, an IPv4 address or an ssh config alias; never starting with '-' (an ssh option)
+HOST_RE = re.compile(r'^(?!-)[A-Za-z0-9._%+@-]+$')
+
+def check_dataset(name, what="dataset"):
+    if not DATASET_RE.match(name or ""):
+        raise ValueError(f"Invalid {what} name '{name}': use letters, digits, _ - . : and / (no spaces)")
+    return name
+
 def parse_target(target):
-    """Split 'host:pool/dataset' into (host, dataset). The remote dataset is exactly that path."""
+    """Split 'host:pool/dataset' into (host, dataset). The remote dataset is exactly that path.
+    Both parts are validated, since the target is a user property and reaches ssh and a remote shell."""
     host, sep, path = target.partition(':')
-    if not (sep and host and '/' in path.strip('/')):
+    path = path.strip('/')
+    if not (sep and host and '/' in path):
         raise ValueError(f"Invalid remote '{target}': expected host:pool/dataset")
-    return host, path.strip('/')
+    if not HOST_RE.match(host):
+        raise ValueError(f"Invalid remote '{target}': bad host '{host}' (use a hostname, user@host, an IP address or an ssh alias)")
+    check_dataset(path, "remote dataset")
+    return host, path
+
+def remote(host, *argv):
+    """argv to run a command on host over ssh. ssh hands the command to the remote shell as one
+    string, so every argument is quoted; '--' stops the host being read as an ssh option."""
+    return ["ssh", "-o", "BatchMode=yes", "--", host, " ".join(shlex.quote(str(a)) for a in argv)]
 
 def human_bytes(n):
     for unit in ("B", "K", "M", "G", "T"):
@@ -130,6 +151,8 @@ def open_lock(name, kind):
 
 def managed_dataset(name):
     """ZzDataset for a managed dataset, or None after printing why not."""
+    try: check_dataset(name)
+    except ValueError as e: print(f"[!] Error: {e}", flush=True); return None
     ds = ZzDataset(name)
     if ds.props is None: print(f"[!] Error: Dataset '{name}' not found.", flush=True); return None
     if ds.target == "-": print(f"[!] Error: Dataset '{name}' is not managed by zz.", flush=True); return None
@@ -199,7 +222,7 @@ def get_managed_datasets():
 
 def get_token(host, dataset):
     try:
-        cmd = ["ssh", "-o", "BatchMode=yes", host, f"zfs get -H -o value receive_resume_token {dataset}"]
+        cmd = zfs_on(host, "get", "-H", "-o", "value", "receive_resume_token", dataset)
         res = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
         return res.strip()
     except subprocess.CalledProcessError:
@@ -268,8 +291,8 @@ def run_transfer(send_cmd, recv_cmd, summary=None):
 HOLD_TAG = "zz_bridge"
 
 def zfs_on(host, *args):
-    """argv for a zfs command, locally or on host over ssh."""
-    return (["ssh", "-o", "BatchMode=yes", host] if host else []) + ["zfs"] + list(args)
+    """argv for a zfs command, locally or on host over ssh (quoted; see remote())."""
+    return remote(host, "zfs", *args) if host else ["zfs"] + list(args)
 
 def held_bridges(dataset, host=None):
     """Snapshot names (after '@') of this dataset carrying a zz_bridge hold."""
@@ -352,8 +375,8 @@ def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
         ds.record_error(f"Skipping {label} prune, invalid setting: {e}"); return True
     print(f"    [*] Pruning {label}...", flush=True)
 
-    cmd = ["zfs", "list", "-t", "snapshot", "-H", "-o", "name,creation", "-p", "-S", "creation", remote_path if is_remote else ds.name]
-    if is_remote: cmd = ["ssh", "-o", "BatchMode=yes", remote_host] + cmd
+    cmd = zfs_on(remote_host, "list", "-t", "snapshot", "-H", "-o", "name,creation", "-p", "-S", "creation",
+                 remote_path if is_remote else ds.name)
     try:
         res = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
@@ -375,8 +398,7 @@ def run_prune(ds, remote_host=None, bridge=None, remote_path=None):
     failed = []
     for snap in [s[0] for s in candidates if (now - s[1]) > retention_sec]:
         print(f"        [-] Destroying {snap}", flush=True)
-        del_cmd = ["zfs", "destroy", "-r", snap]
-        if is_remote: del_cmd = ["ssh", "-o", "BatchMode=yes", remote_host] + del_cmd
+        del_cmd = zfs_on(remote_host, "destroy", "-r", snap)
         if subprocess.run(del_cmd).returncode != 0: failed.append(snap)
     if failed:
         ds.record_error(f"Could not destroy {len(failed)} {label} snapshot(s), e.g. {failed[0]}."); return True
@@ -408,11 +430,13 @@ def init_failed(reason, hint=None):
     return True
 
 def run_init(args):
+    try: check_dataset(args.dataset)
+    except ValueError as e: return init_failed(str(e))
     ds = ZzDataset(args.dataset)
     if ds.props is None: return init_failed(f"dataset '{args.dataset}' not found.")
     try: remote_host, remote_path = parse_target(args.remote)
     except ValueError as e: return init_failed(str(e))
-    recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {REPLICA_RECV_OPTS} {remote_path}"]
+    recv_cmd = zfs_on(remote_host, "recv", "-s", "-u", *REPLICA_RECV_OPTS, remote_path)
 
     if is_busy_local(args.dataset) or is_token_active(remote_host, remote_path):
         return init_failed(f"a transfer for {args.dataset} is already running.", "Wait for it to finish, then run init again.")
@@ -434,7 +458,7 @@ def run_init(args):
         init_done(args.dataset, args.remote)
         return
 
-    probe = subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -H -o name {remote_path}"],
+    probe = subprocess.run(zfs_on(remote_host, "list", "-H", "-o", "name", remote_path),
                            capture_output=True, text=True)
     if probe.returncode == 0:
         return init_failed(f"{remote_path} already exists on {remote_host}; refusing to overwrite it.",
@@ -444,7 +468,7 @@ def run_init(args):
                            f"Check with: ssh {remote_host} zfs list   (key-based login is required)")
     parent = remote_path.rsplit('/', 1)[0]
     if '/' in parent:
-        mk = subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs create -p {parent}"], capture_output=True, text=True)
+        mk = subprocess.run(zfs_on(remote_host, "create", "-p", parent), capture_output=True, text=True)
         if mk.returncode != 0:
             return init_failed(f"could not create {parent} on {remote_host}: {mk.stderr.strip()}")
 
@@ -487,7 +511,7 @@ def run_sync(args):
         try: remote_host, remote_path = parse_target(ds.target)
         except ValueError as e:
             ds.record_error(str(e)); failed = True; continue
-        recv_cmd = ["ssh", remote_host, f"zfs recv -s -u {remote_path}"]
+        recv_cmd = zfs_on(remote_host, "recv", "-s", "-u", remote_path)
         try: send_flags = parse_send_flags(ds.props.get("zz:send_flags"))
         except ValueError as e:
             ds.record_error(f"zz:send_flags: {e}"); failed = True; continue
@@ -554,7 +578,7 @@ def run_sync(args):
 
         # Identify the "Bridge" (latest common snapshot)
         try:
-            cmd = ["ssh", "-o", "BatchMode=yes", remote_host, f"zfs list -t snapshot -H -S creation -o name {remote_path}"]
+            cmd = zfs_on(remote_host, "list", "-t", "snapshot", "-H", "-S", "creation", "-o", "name", remote_path)
             res = subprocess.check_output(cmd, encoding='utf-8')
             remote_snaps = [l.strip().split('@')[1] for l in res.strip().split('\n') if "@zz_auto_" in l]
             if not remote_snaps:
@@ -649,14 +673,12 @@ def run_forget(args):
 
 def zz_snaps(dataset, host=None):
     """zz_auto_ snapshot tags of exactly this dataset, newest first. Raises on failure."""
-    cmd = ["zfs", "list", "-t", "snapshot", "-H", "-S", "creation", "-o", "name", dataset]
-    if host: cmd = ["ssh", "-o", "BatchMode=yes", host] + cmd
+    cmd = zfs_on(host, "list", "-t", "snapshot", "-H", "-S", "creation", "-o", "name", dataset)
     res = subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
     return [l.split('@', 1)[1] for l in res.splitlines() if "@zz_auto_" in l]
 
 def snap_guid(snapshot, host=None):
-    cmd = ["zfs", "get", "-H", "-o", "value", "guid", snapshot]
-    if host: cmd = ["ssh", "-o", "BatchMode=yes", host] + cmd
+    cmd = zfs_on(host, "get", "-H", "-o", "value", "guid", snapshot)
     try: return subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL).strip()
     except subprocess.CalledProcessError: return None
 
@@ -691,6 +713,8 @@ def run_restore(args):
     try: remote_host, remote_ds = parse_target(args.remote)
     except ValueError as e: print(f"[!] {e}", flush=True); return True
     local_ds = args.local_dataset
+    try: check_dataset(local_ds)
+    except ValueError as e: print(f"[!] {e}", flush=True); return True
     recv_cmd = ["zfs", "recv", "-s", "-u", local_ds]
     print(f"[*] Starting Recovery: {args.remote} -> {local_ds}", flush=True)
 
@@ -708,14 +732,13 @@ def run_restore(args):
         print(f"[*] Restore point: @{latest} ({datetime.datetime.fromtimestamp(snap_time(latest)).strftime('%Y-%m-%d %H:%M:%S')}); "
               f"{len(newer)} newer snapshot(s) on the replica will not be restored", flush=True)
     try:
-        res = subprocess.check_output(["ssh", "-o", "BatchMode=yes", remote_host,
-                                       f"zfs get all -H -o property,value {remote_ds}"], encoding='utf-8')
+        res = subprocess.check_output(zfs_on(remote_host, "get", "all", "-H", "-o", "property,value", remote_ds), encoding='utf-8')
         pairs = [l.split('\t', 1) for l in res.splitlines() if '\t' in l]
         remote_props = {p: v for p, v in pairs if p.startswith("zz:") and not p.startswith("zz:last_")}
     except subprocess.CalledProcessError:
         print(f"[!] Could not read properties of {remote_ds} on {remote_host}.", flush=True); return True
     # Send back the same way it was sent (e.g. raw for encrypted data)
-    try: rflags = " ".join(parse_send_flags(remote_props.get("zz:send_flags")))
+    try: rflags = parse_send_flags(remote_props.get("zz:send_flags"))
     except ValueError as e: print(f"[!] Remote zz:send_flags: {e}", flush=True); return True
 
     # The replica tree. Children deleted on the primary stay on the replica (zz never receives
@@ -747,7 +770,7 @@ def run_restore(args):
             for k in missing:
                 if f"{k}@{latest}" not in snaps_temp:
                     subprocess.run(zfs_on(remote_host, "snapshot", "-o", "zz:restore_temp=on", f"{k}@{latest}"), check=True)
-    exclude = f"-X {','.join(stale)}" if stale else ""
+    exclude = ["-X", ",".join(stale)] if stale else []
     local_name = lambda k: local_ds + k[len(remote_ds):]
 
     # 1. Finish an interrupted receive, if there is one
@@ -757,7 +780,7 @@ def run_restore(args):
     exists = subprocess.run(["zfs", "list", local_ds], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if token != "-":
         print(f"[*] Resuming interrupted restore...", flush=True)
-        if run_transfer(["ssh", remote_host, f"zfs send -v -t {token}"], recv_cmd) != 0:
+        if run_transfer(zfs_on(remote_host, "send", "-v", "-t", token), recv_cmd) != 0:
             print("[!] Restore interrupted again. Run the same command to resume.", flush=True); return True
     elif exists:
         # Only continue into an existing dataset if it is an unfinished restore from this remote
@@ -771,8 +794,8 @@ def run_restore(args):
     else:
         mode = "latest snapshot only" if args.latest else "full history"
         print(f"[*] Restoring @{latest} ({mode})...", flush=True)
-        send = f"zfs send {'-v' if args.latest else '-R -v'} {exclude} {rflags} {remote_ds}@{latest}"
-        if run_transfer(["ssh", remote_host, send], recv_cmd) != 0:
+        send = (["-v"] if args.latest else ["-R", "-v"] + exclude) + rflags + [f"{remote_ds}@{latest}"]
+        if run_transfer(zfs_on(remote_host, "send", *send), recv_cmd) != 0:
             print("[!] Restore interrupted. Run the same command to resume.", flush=True); return True
 
     # 2. Bring every dataset in the tree up to @latest. A resumed stream only completes the
@@ -785,13 +808,13 @@ def run_restore(args):
         except subprocess.CalledProcessError: have_local = None     # not here yet
         if have_local and have_local[0] == latest: continue
         sub_ex = [x for x in stale if x.startswith(k + "/")]
-        ex = f"-X {','.join(sub_ex)}" if sub_ex else ""
-        base = "-v" if args.latest else f"-R -v {ex}"   # recursive, for creating a missing subtree
+        ex = ["-X", ",".join(sub_ex)] if sub_ex else []
+        base = ["-v"] if args.latest else ["-R", "-v"] + ex   # recursive, for creating a missing subtree
         if not have_local:
             if have_local is not None:   # exists but has no zz snapshots: not something zz restored
                 print(f"[!] {lk} exists but has no zz snapshots; move it aside and run restore again.", flush=True); return True
             print(f"[*] Restoring missing {lk}...", flush=True)
-            send = f"zfs send {base} {rflags} {k}@{latest}"
+            send = base + rflags + [f"{k}@{latest}"]
         else:
             if not args.latest and f"{k}@{have_local[0]}" not in all_remote and k != remote_ds:
                 print(f"[!] {lk}@{have_local[0]} not found on the remote; cannot continue.", flush=True); return True
@@ -799,8 +822,8 @@ def run_restore(args):
                 print(f"[!] Local @{have_local[0]} not found on remote; cannot continue.", flush=True); return True
             # Flags must come before -i/-I, which takes the next argument as its snapshot
             print(f"[*] Catching up {lk} @{have_local[0]} -> @{latest}...", flush=True)
-            send = f"zfs send -v {rflags} {'-i' if args.latest else '-I'} @{have_local[0]} {k}@{latest}"
-        if run_transfer(["ssh", remote_host, send], ["zfs", "recv", "-s", "-u", lk]) != 0:
+            send = ["-v"] + rflags + ["-i" if args.latest else "-I", f"@{have_local[0]}", f"{k}@{latest}"]
+        if run_transfer(zfs_on(remote_host, "send", *send), ["zfs", "recv", "-s", "-u", lk]) != 0:
             print("[!] Restore interrupted. Run the same command to resume.", flush=True); return True
     behind = []
     for k in expected:
@@ -928,11 +951,8 @@ def run_status(args):
 def snap_table(dataset, host=None):
     """{tag: (creation, used, written)} for zz_auto_ snapshots of exactly this dataset, plus
     the dataset's usedbysnapshots. Raises CalledProcessError on failure."""
-    cmd = ["zfs", "list", "-t", "snapshot", "-H", "-p", "-o", "name,creation,used,written", dataset]
-    ubs = ["zfs", "get", "-H", "-p", "-o", "value", "usedbysnapshots", dataset]
-    if host:
-        cmd = ["ssh", "-o", "BatchMode=yes", host] + cmd
-        ubs = ["ssh", "-o", "BatchMode=yes", host] + ubs
+    cmd = zfs_on(host, "list", "-t", "snapshot", "-H", "-p", "-o", "name,creation,used,written", dataset)
+    ubs = zfs_on(host, "get", "-H", "-p", "-o", "value", "usedbysnapshots", dataset)
     rows = {}
     for line in subprocess.check_output(cmd, encoding='utf-8', stderr=subprocess.DEVNULL).splitlines():
         name, creation, used, written = line.split('\t')
@@ -1027,6 +1047,8 @@ def run_meta(args):
 
 def run_set(args):
     args.value = " ".join(args.value).strip()
+    try: check_dataset(args.dataset)
+    except ValueError as e: print(f"[!] {e}", flush=True); return True
     if not args.value: print("[!] Not updated: a value is required.", flush=True); return True
     ds = ZzDataset(args.dataset)
     if ds.props is None:
@@ -1050,7 +1072,7 @@ def run_abort(args):
     except ValueError as e: print(f"[!] {e}", flush=True); return True
     if get_token(remote_host, remote_path) == "-":
         print(f"[*] No interrupted transfer on {remote_host}:{remote_path}; nothing to abort.", flush=True); return
-    if subprocess.run(["ssh", "-o", "BatchMode=yes", remote_host, f"zfs recv -A {remote_path}"]).returncode != 0:
+    if subprocess.run(zfs_on(remote_host, "recv", "-A", remote_path)).returncode != 0:
         print("[!] Could not clear the resume token.", flush=True); return True
     print("[+] Resume token cleared.", flush=True)
 

@@ -508,6 +508,30 @@ if [ $SKIP = 0 ]; then
     check "…nothing was created"            bash -c "! zfs list '$P' >/dev/null 2>&1"
 fi
 
+T injection
+if [ $SKIP = 0 ]; then
+    # zz:target is a user property: with delegated ZFS permissions a non-root user could set it,
+    # then root's cron runs zz. Set it directly (bypassing zz's own checks) and try to inject.
+    V=$SRC/evil; zfs create "$V"
+    i=0; for t in "zzremote:$DST/x;touch $WORK/pwned" "zzremote:$DST/x\$(touch $WORK/pwned)" \
+                  "zzremote:$DST/x\`touch $WORK/pwned\`" "-oProxyCommand=touch $WORK/pwned:$DST/x" \
+                  "zzremote:$DST/x|touch $WORK/pwned"; do
+        i=$((i+1)); zfs set "zz:target=$t" "$V"
+        run sync "$V" --now
+        check "injected target #$i refused"      rc_is 1
+        check "…as an invalid remote"           out_has "Invalid remote"
+    done
+    check "no injected command ever ran"    [ ! -e "$WORK/pwned" ]
+    run init "$DS" "zzremote:$DST/y;touch $WORK/pwned"
+    check "init refuses an injected target" rc_is 1
+    run restore "zzremote:$DST/y\$(touch $WORK/pwned)" "$SRC/r"
+    check "restore refuses an injected target" rc_is 1
+    run init "$SRC/has space" "zzremote:$DST/z"
+    check "dataset names with spaces rejected clearly" out_has "no spaces"
+    check "still nothing ran"               [ ! -e "$WORK/pwned" ]
+    zfs destroy -r "$V"
+fi
+
 T forget
 if [ $SKIP = 0 ]; then
     run forget "$DS"

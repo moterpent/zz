@@ -54,6 +54,37 @@ class SendFlags(unittest.TestCase):
                 zz.parse_send_flags(bad)
 
 
+class Injection(unittest.TestCase):
+    """Targets are user properties that reach ssh and a remote shell."""
+
+    def test_rejects_shell_and_option_injection(self):
+        for bad in ["backup:pool/x; rm -rf /", "backup:pool/x$(id)", "backup:pool/`id`", "backup:pool/x|y",
+                    "-oProxyCommand=touch /tmp/p:pool/x", "back up:pool/x", "backup:pool/has space",
+                    "backup:pool/x&&id", "backup:pool/x\nid"]:
+            with self.assertRaises(ValueError, msg=bad):
+                zz.parse_target(bad)
+
+    def test_accepts_normal_targets(self):
+        for good in ["backup:pool/data", "root@10.0.0.2:tank/a_b-c.d/e:f", "backup.example.com:pool/x", "burp_replica:tank/burp1"]:
+            zz.parse_target(good)
+
+    def test_dataset_names(self):
+        zz.check_dataset("tank/data/child_1.x-y:z")
+        for bad in ["tank/a b", "tank/a;b", "", "tank//x", "/tank"]:
+            with self.assertRaises(ValueError, msg=bad):
+                zz.check_dataset(bad)
+
+    def test_remote_args_are_quoted_for_the_remote_shell(self):
+        import subprocess, tempfile, os
+        marker = os.path.join(tempfile.mkdtemp(), "pwned")
+        argv = zz.remote("somehost", "echo", f"pool/x; touch {marker}", "$(touch " + marker + ")")
+        self.assertEqual(argv[:5], ["ssh", "-o", "BatchMode=yes", "--", "somehost"])
+        # Run the command string the way the remote shell would
+        out = subprocess.run(["bash", "-c", argv[5]], capture_output=True, text=True).stdout
+        self.assertFalse(os.path.exists(marker))
+        self.assertIn("pool/x; touch", out)
+
+
 class Formatting(unittest.TestCase):
     def test_human_bytes(self):
         self.assertEqual(zz.human_bytes(0), "0B")
